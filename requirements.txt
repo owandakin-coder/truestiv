@@ -24,3 +24,4 @@ passlib[bcrypt]
 email-validator
 pydantic[email]
 >>>>>>> 0d153cab717f425e986ad45f026941f60180a945
+email-validator
