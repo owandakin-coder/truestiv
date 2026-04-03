@@ -14,7 +14,7 @@ def _mock_analysis_with_hijack(content: str, sender: str = "", subject: str = ""
     """
     Mock analysis with hijack detection logic, adapted for channel
     """
-    text = f"{content} {sender} {subject}".lower()
+    text = f"{content or ''} {sender or ''} {subject or ''}".lower()
     
     # General phishing keywords (expanded)
     phishing = [
