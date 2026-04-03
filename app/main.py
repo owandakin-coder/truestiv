@@ -5,6 +5,7 @@ from app.models.models import Base
 from app.routers import auth, analysis, trust, community, scanner
 from app.core.billing import seed_plans
 from app.routers import analysis
+from app.routers import notifications
 
 # Create database tables
 Base.metadata.create_all(bind=engine)
@@ -31,6 +32,7 @@ app.include_router(analysis.router, prefix="/api/analysis", tags=["Analysis"])
 app.include_router(trust.router, prefix="/api/trust", tags=["Trust"])
 app.include_router(community.router, prefix="/api/community", tags=["Community"])
 app.include_router(scanner.router, prefix="/api/scanner", tags=["Scanner"])
+app.include_router(notifications.router, prefix="/api", tags=["Notifications"])
 
 
 @app.get("/")
