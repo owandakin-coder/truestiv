@@ -1,5 +1,6 @@
 import hashlib
 import re
+import socket
 from datetime import datetime, timedelta
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
@@ -12,9 +13,72 @@ from app.models.models import User, EmailAnalysis, EmailThread, ThreatPropagatio
 from app.schemas.schemas import EmailAnalysisRequest
 from typing import List, Dict
 from urllib.parse import urlparse
+from typing import List, Tuple
 
 router = APIRouter()
 
+EMAIL_REGEX = r"[^@]+@[^@]+\.[^@]+"
+PHONE_REGEX = r"^\+?[0-9]{7,15}$"
+
+DISPOSABLE_DOMAINS = {
+    "mailinator.com",
+    "10minutemail.com",
+    "guerrillamail.com",
+    "tempmail.com",
+}
+
+SUSPICIOUS_KEYWORDS = [
+    "urgent", "immediately", "password", "bank", "verify", "click here",
+    "account locked", "wire transfer", "payment", "invoice", "reset",
+]
+
+def is_valid_email(email: str) -> bool:
+    return bool(re.match(EMAIL_REGEX, email or ""))
+
+def is_valid_phone(phone: str) -> bool:
+    return bool(re.match(PHONE_REGEX, phone or ""))
+
+def split_email(email: str) -> Tuple[str, str]:
+    if "@" not in email:
+        return email, ""
+    local, domain = email.split("@", 1)
+    return local, domain.lower().strip()
+
+def is_disposable_domain(domain: str) -> bool:
+    return domain in DISPOSABLE_DOMAINS
+
+def has_mx_record(domain: str) -> bool:
+    try:
+        socket.gethostbyname(domain)
+        return True
+    except Exception:
+        return False
+
+def looks_like_spoof(domain: str, trusted_domains: List[str]) -> bool:
+    domain_lower = domain.lower()
+    for trusted in trusted_domains:
+        if trusted in domain_lower and domain_lower != trusted:
+            return True
+    return False
+
+def analyze_urls_basic(urls: List[str]) -> dict:
+    suspicious = []
+    for u in urls:
+        u_lower = u.lower()
+        if any(bad in u_lower for bad in ["login", "verify", "update", "secure", "paypal", "bank"]):
+            suspicious.append(u)
+    return {
+        "suspicious_urls": suspicious,
+        "has_suspicious_urls": len(suspicious) > 0,
+    }
+
+def keyword_risk_score(content: str) -> int:
+    text = (content or "").lower()
+    score = 0
+    for kw in SUSPICIOUS_KEYWORDS:
+        if kw in text:
+            score += 5
+    return score
 
 def extract_urls(text: str) -> List[str]:
     url_pattern = r'https?://[^\s]+|www\.[^\s]+'
@@ -170,9 +234,8 @@ def analyze_message(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    # =====================
-    # VALIDATION (CRITICAL)
-    # =====================
+    # 1. VALIDATION
+
     if request.channel == "email":
         if not request.sender:
             raise HTTPException(status_code=400, detail="Sender email is required")
@@ -185,23 +248,19 @@ def analyze_message(
         if not is_valid_phone(request.phone_number):
             raise HTTPException(status_code=400, detail="Invalid phone number")
 
-    if not request.content or len(request.content.strip()) < 3:
-        raise HTTPException(status_code=400, detail="Content too short")
+    content = (request.content or "").strip()
+    if not content:
+        raise HTTPException(status_code=400, detail="Content cannot be empty")
 
-    # =====================
-    # LIMIT CHECK
-    # =====================
+    # 2. CHECK USAGE LIMIT
     check_scan_limit(db, current_user.id)
 
-    content = request.content.strip()
+    # 3. PREPROCESS
     urls = extract_urls(content)
-
     sender_value = request.sender or request.phone_number or ""
     missing_identity = not sender_value
 
-    # =====================
-    # AI ANALYSIS
-    # =====================
+    # 4. AI ANALYSIS
     result = analyze_threat(
         content=content,
         content_type=request.channel,
@@ -211,49 +270,68 @@ def analyze_message(
     )
 
     if not result["success"]:
-        raise HTTPException(status_code=500, detail="Analysis failed")
+        raise HTTPException(status_code=500, detail=result.get("error", "Analysis failed"))
 
     analysis = result["analysis"]
 
-    # =====================
-    # 🔥 ZERO TRUST LOGIC
-    # =====================
+    # 5. SECURITY ENHANCEMENTS & RISK SCORING
     risk_score = 0
 
+    # Missing sender
     if missing_identity:
-        risk_score += 30
+        if analysis["threat_level"] == "safe":
+            analysis["threat_level"] = "suspicious"
+        analysis["confidence"] = min(analysis.get("confidence", 0.5), 0.5)
+        analysis["summary"] += " | Warning: Missing sender/phone information"
+        risk_score += 15
 
-    if urls:
+    # Email checks
+    if request.channel == "email" and request.sender:
+        local, domain = split_email(request.sender)
+
+        if not has_mx_record(domain):
+            analysis["threat_level"] = "suspicious"
+            analysis["summary"] += " | Domain has no valid DNS/MX record"
+            risk_score += 15
+
+        if is_disposable_domain(domain):
+            analysis["threat_level"] = "suspicious"
+            analysis["summary"] += " | Disposable email domain detected"
+            risk_score += 10
+
+        trusted_domains = ["paypal.com", "google.com", "microsoft.com", "bankofamerica.com"]
+        if looks_like_spoof(domain, trusted_domains):
+            analysis["threat_level"] = "dangerous"
+            analysis["summary"] += " | Possible spoofed domain"
+            risk_score += 25
+
+    # Phone checks
+    if request.channel in ["sms", "whatsapp"] and request.phone_number:
+        risk_score += 5
+
+    # URL checks
+    url_info = analyze_urls_basic(urls)
+    if url_info["has_suspicious_urls"]:
+        analysis["threat_level"] = "suspicious"
+        analysis["summary"] += " | Suspicious URLs detected"
         risk_score += 20
 
-    if analysis["threat_level"] == "threat":
-        risk_score += 50
-    elif analysis["threat_level"] == "suspicious":
-        risk_score += 25
+    # Keyword risk
+    risk_score += keyword_risk_score(content)
 
-    if len(content) < 10:
+    # Very short content
+    if len(content) < 5:
+        analysis["threat_level"] = "suspicious"
+        analysis["summary"] += " | Very short content"
         risk_score += 10
 
-    # =====================
-    # FINAL DECISION
-    # =====================
-    if risk_score >= 60:
-        final_level = "threat"
-    elif risk_score >= 30:
-        final_level = "suspicious"
-    else:
-        final_level = "safe"
+    # Normalize risk score
+    risk_score = max(0, min(100, risk_score))
 
-    # override AI if needed
-    analysis["threat_level"] = final_level
-    analysis["confidence"] = min(100, max(40, risk_score))
+    if risk_score >= 60 and analysis["threat_level"] == "safe":
+        analysis["threat_level"] = "suspicious"
 
-    if missing_identity:
-        analysis["summary"] += " | ⚠ Missing sender/phone"
-
-    # =====================
-    # SIGNATURE + DB
-    # =====================
+    # 6. THREAT SIGNATURE
     threat_signature = generate_threat_signature(
         analysis,
         sender_value,
@@ -276,32 +354,39 @@ def analyze_message(
         current_user.id
     )
 
+    # 7. SAVE
     db_analysis = _save_analysis(request, analysis, db, current_user)
 
     for related in related_threats:
-        db.add(ThreatPropagation(
+        propagation = ThreatPropagation(
             threat_signature=threat_signature,
             source_analysis_id=related["id"],
             target_analysis_id=db_analysis.id,
             propagation_type="same_threat",
             user_id=current_user.id
-        ))
+        )
+        db.add(propagation)
 
     db.commit()
     db.refresh(db_analysis)
 
+    # 8. USAGE TRACKING
     increment_scan_usage(db, current_user.id)
 
+    # 9. RESPONSE
     return {
         "success": True,
         "id": db_analysis.id,
         "threat_level": analysis["threat_level"],
         "confidence": analysis["confidence"],
+        "threat_type": analysis.get("threat_type", "unknown"),
         "summary": analysis["summary"],
-        "risk_score": risk_score,  # 🔥 NEW!
+        "indicators": analysis.get("indicators", []),
+        "recommendation": analysis.get("recommendation", "allow"),
         "is_quarantined": db_analysis.is_quarantined,
         "channel": request.channel,
-        "related_threats_count": len(related_threats)
+        "related_threats_count": len(related_threats),
+        "risk_score": risk_score,
     }
 
 
