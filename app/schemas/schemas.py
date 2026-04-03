@@ -2,7 +2,14 @@ from pydantic import BaseModel, EmailStr
 from datetime import datetime
 from typing import Optional, List
 
+class ThreatPublishRequest(BaseModel):
+    threat_type: str   # 'ip', 'url', 'domain', 'email'
+    indicator: str
+    risk_score: Optional[int] = None
+    threat_level: str
+    analysis_id: Optional[int] = None
 
+    
 class UserCreate(BaseModel):
     email: EmailStr
     username: str
