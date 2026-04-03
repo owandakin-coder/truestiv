@@ -2,14 +2,15 @@ from pydantic import BaseModel, EmailStr
 from datetime import datetime
 from typing import Optional, List
 
+
 class ThreatPublishRequest(BaseModel):
-    threat_type: str   # 'ip', 'url', 'domain', 'email'
+    threat_type: str
     indicator: str
     risk_score: Optional[int] = None
     threat_level: str
     analysis_id: Optional[int] = None
 
-    
+
 class UserCreate(BaseModel):
     email: EmailStr
     username: str
@@ -38,11 +39,11 @@ class LoginRequest(BaseModel):
 
 
 class EmailAnalysisRequest(BaseModel):
-    subject: Optional[str] = ""          # למייל
-    sender: Optional[str] = ""           # למייל
-    phone_number: Optional[str] = None   # ל-SMS/WhatsApp
+    subject: Optional[str] = ""
+    sender: Optional[str] = ""
+    phone_number: Optional[str] = None
     content: str
-    channel: str = "email"               # email, sms, whatsapp
+    channel: str = "email"
 
 
 class EmailAnalysisResponse(BaseModel):
@@ -51,16 +52,19 @@ class EmailAnalysisResponse(BaseModel):
     threat_type: str
     confidence: float
     summary: str
-    explanation_hebrew: Optional[str] = None
     indicators: List[str] = []
     recommendation: str
-    recommendation_hebrew: Optional[str] = None
     is_quarantined: bool
     hijack_detected: bool = False
     writing_style_change: bool = False
     suspicious_domain: bool = False
-    channel: str = "email"
+    channel: str
     created_at: datetime
+    sender: Optional[str] = None
+    phone_number: Optional[str] = None
+    subject: Optional[str] = None
+    related_threats_count: Optional[int] = 0
+    risk_score: Optional[int] = 0
 
     class Config:
         from_attributes = True
@@ -93,3 +97,16 @@ class ThreadResponse(BaseModel):
     hijack_risk: bool
     last_seen: str
     first_seen: str
+
+
+class ThreatPropagationResponse(BaseModel):
+    id: int
+    threat_signature: str
+    source_analysis_id: int
+    target_analysis_id: int
+    propagation_type: str
+    user_id: int
+    detected_at: datetime
+
+    class Config:
+        from_attributes = True
