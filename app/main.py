@@ -2,12 +2,9 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.core.database import engine
 from app.models.models import Base
-from app.routers import auth, analysis, trust, community, scanner
+from app.routers import auth, analysis, trust, community, scanner, notifications
 from app.core.billing import seed_plans
-from app.routers import analysis
-from app.routers import notifications
 
-# Create database tables
 Base.metadata.create_all(bind=engine)
 
 app = FastAPI(
@@ -17,23 +14,25 @@ app = FastAPI(
     description="AI-powered conversation hijack detection, threat intelligence, URL/IP/File scanning, and multi-channel security analysis"
 )
 
-# CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://truestiv-frontend.vercel.app", "http://localhost:5000", "http://localhost:5173","https://truestiv-frontend-5i26o56kp-true-t.vercel.app" ],
+    allow_origins=[
+        "https://truestiv-frontend.vercel.app",
+        "http://localhost:5000",
+        "http://localhost:5173",
+        "https://truestiv-frontend-5i26o56kp-true-t.vercel.app"
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Include routers
 app.include_router(auth.router, prefix="/api/auth", tags=["Authentication"])
 app.include_router(analysis.router, prefix="/api/analysis", tags=["Analysis"])
 app.include_router(trust.router, prefix="/api/trust", tags=["Trust"])
 app.include_router(community.router, prefix="/api/community", tags=["Community"])
 app.include_router(scanner.router, prefix="/api/scanner", tags=["Scanner"])
-app.include_router(notifications.router, prefix="/api", tags=["Notifications"])
-
+app.include_router(notifications.router, prefix="/api/notifications", tags=["Notifications"])
 
 @app.get("/")
 async def root():
@@ -47,13 +46,12 @@ async def root():
             "Homograph Domain Detection",
             "Writing Style Analysis",
             "Community Threat Intelligence",
-            "URL Scanner (malicious patterns, homographs, IP reputation)",
-            "IP Reputation Check (malicious IP ranges, Tor detection)",
-            "File Scanner (dangerous extensions, double extensions, hash check)",
-            "API Key Management (for integrations)"
+            "URL Scanner",
+            "IP Reputation Check",
+            "File Scanner",
+            "API Key Management"
         ]
     }
-
 
 @app.get("/api/health")
 def health_check():
