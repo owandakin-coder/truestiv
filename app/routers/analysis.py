@@ -427,7 +427,8 @@ def analyze_message(
             # Extract first URL or use sender/phone as indicator
             indicator = urls[0] if urls else (request.sender or request.phone_number or "")
             threat_type = "url" if urls else ("email" if request.channel == "email" else "phone")
-            publish_url = f"{settings.BASE_URL}/api/community/publish-threat"  # או hard-coded לצורך פיתוח
+            base_url = settings.BASE_URL
+            publish_url = f"{base_url}/api/community/publish-threat"  # hard-coded 
             headers = {"Authorization": f"Bearer {request.headers.get('authorization', '').replace('Bearer ', '')}"}
             requests.post(
                 publish_url,
