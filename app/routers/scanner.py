@@ -12,8 +12,6 @@ import secrets
 
 router = APIRouter()
 
-# ---- URL Analysis ----
-
 SUSPICIOUS_PATTERNS = [
     r'bit\.ly', r'tinyurl', r'goo\.gl', r't\.co',
     r'paypa1', r'arnazon', r'g00gle', r'rn\.com',
@@ -39,66 +37,58 @@ def analyze_url(data: dict, db: Session = Depends(get_db), current_user: User = 
     indicators = []
     risk_score = 0
 
-    # Check suspicious patterns
     for pattern in SUSPICIOUS_PATTERNS:
         if re.search(pattern, url, re.IGNORECASE):
             indicators.append(f"Suspicious pattern detected: {pattern}")
             risk_score += 15
 
-    # Check domain
     try:
         domain = re.findall(r'://([^/]+)', url)[0].lower()
         if domain in MALICIOUS_DOMAINS:
             indicators.append(f"Known malicious domain: {domain}")
             risk_score += 60
 
-        # Homograph detection
         if any(c in domain for c in ['0', '1', 'rn', 'vv']):
-            indicators.append("Possible homograph attack (character substitution)")
+            indicators.append("Possible homograph attack")
             risk_score += 20
 
-        # Excessive subdomains
         parts = domain.split('.')
         if len(parts) > 4:
-            indicators.append("Excessive subdomains - common phishing tactic")
+            indicators.append("Excessive subdomains")
             risk_score += 15
 
-        # Long domain
         if len(domain) > 50:
-            indicators.append("Unusually long domain name")
+            indicators.append("Unusually long domain")
             risk_score += 10
 
-        # IP in URL
         try:
             ipaddress.ip_address(domain)
-            indicators.append("IP address used instead of domain name")
+            indicators.append("IP address used instead of domain")
             risk_score += 25
         except ValueError:
             pass
 
-    except (IndexError, Exception):
+    except Exception:
         indicators.append("Could not parse domain")
         risk_score += 10
 
-    # HTTPS check
     if not url.startswith('https://'):
-        indicators.append("No HTTPS — connection is not encrypted")
+        indicators.append("No HTTPS")
         risk_score += 10
 
-    # Determine threat level
     risk_score = min(100, risk_score)
     if risk_score >= 60:
         threat_level = "threat"
         recommendation = "block"
-        summary = "This URL shows multiple high-risk indicators. It is likely malicious."
+        summary = "This URL shows multiple high-risk indicators."
     elif risk_score >= 30:
         threat_level = "suspicious"
         recommendation = "quarantine"
-        summary = "This URL has some suspicious characteristics. Exercise caution."
+        summary = "This URL has suspicious characteristics."
     else:
         threat_level = "safe"
         recommendation = "allow"
-        summary = "No significant threat indicators found in this URL."
+        summary = "No significant threat indicators found."
 
     return {
         "success": True,
@@ -111,8 +101,6 @@ def analyze_url(data: dict, db: Session = Depends(get_db), current_user: User = 
         "summary": summary
     }
 
-
-# ---- IP Reputation ----
 
 KNOWN_BAD_IPS = [
     '185.220.101.', '194.165.16.', '45.33.32.',
@@ -133,7 +121,6 @@ def check_ip(data: dict, db: Session = Depends(get_db), current_user: User = Dep
     indicators = []
     risk_score = 0
 
-    # Private IP check
     if ip_obj.is_private:
         return {
             "success": True,
@@ -144,11 +131,10 @@ def check_ip(data: dict, db: Session = Depends(get_db), current_user: User = Dep
             "type": "private",
             "indicators": ["Private/internal IP address"],
             "recommendation": "allow",
-            "summary": "This is a private IP address (internal network).",
+            "summary": "Private IP address.",
             "geo": {"country": "Internal", "isp": "Private Network"}
         }
 
-    # Loopback
     if ip_obj.is_loopback:
         return {
             "success": True,
@@ -163,22 +149,19 @@ def check_ip(data: dict, db: Session = Depends(get_db), current_user: User = Dep
             "geo": {}
         }
 
-    # Check against known bad prefixes
     for bad_prefix in KNOWN_BAD_IPS:
         if ip.startswith(bad_prefix):
             indicators.append(f"IP range associated with malicious activity: {bad_prefix}*")
             risk_score += 50
 
-    # Tor exit node simulation
     last_octet = int(ip.split('.')[-1])
     if last_octet % 7 == 0:
         indicators.append("Possible Tor exit node")
         risk_score += 20
 
-    # Hosting/datacenter range simulation
     first_octet = int(ip.split('.')[0])
     if first_octet in [104, 198, 45, 167, 178]:
-        indicators.append("Cloud/datacenter IP range — often used for automated attacks")
+        indicators.append("Cloud/datacenter IP range")
         risk_score += 15
 
     risk_score = min(100, risk_score)
@@ -188,7 +171,7 @@ def check_ip(data: dict, db: Session = Depends(get_db), current_user: User = Dep
         summary = "This IP has been associated with malicious activity."
     elif risk_score >= 25:
         threat_level, recommendation = "suspicious", "quarantine"
-        summary = "This IP shows some suspicious characteristics."
+        summary = "This IP shows suspicious characteristics."
     else:
         threat_level, recommendation = "safe", "allow"
         summary = "No significant threats associated with this IP."
@@ -210,8 +193,6 @@ def check_ip(data: dict, db: Session = Depends(get_db), current_user: User = Dep
         }
     }
 
-
-# ---- File Scanner ----
 
 DANGEROUS_EXTENSIONS = [
     '.exe', '.bat', '.cmd', '.vbs', '.js', '.jar',
@@ -237,7 +218,6 @@ def scan_file(data: dict, db: Session = Depends(get_db), current_user: User = De
 
     ext = '.' + filename.rsplit('.', 1)[-1].lower() if '.' in filename else ''
 
-    # Extension check
     if ext in DANGEROUS_EXTENSIONS:
         indicators.append(f"Dangerous file type: {ext}")
         risk_score += 55
@@ -245,29 +225,25 @@ def scan_file(data: dict, db: Session = Depends(get_db), current_user: User = De
         indicators.append(f"Potentially dangerous file type: {ext}")
         risk_score += 20
 
-    # Double extension
     parts = filename.lower().split('.')
     if len(parts) > 2:
-        indicators.append("Double extension detected — common malware tactic")
+        indicators.append("Double extension detected")
         risk_score += 30
 
-    # Suspicious filename patterns
     suspicious_names = ['invoice', 'payment', 'urgent', 'verify', 'update', 'free', 'prize', 'winner']
     for name in suspicious_names:
         if name in filename.lower():
             indicators.append(f"Suspicious filename keyword: '{name}'")
             risk_score += 10
 
-    # File size checks
     if file_size > 0:
         if file_size < 1024:
-            indicators.append("Unusually small file — may be a dropper")
+            indicators.append("Unusually small file")
             risk_score += 10
         elif file_size > 100 * 1024 * 1024:
-            indicators.append("Very large file — unusual for executables")
+            indicators.append("Very large file")
             risk_score += 5
 
-    # Simulate hash check
     if file_hash:
         simulated_bad = hashlib.md5(file_hash.encode()).hexdigest()
         if simulated_bad.startswith('a'):
@@ -278,13 +254,13 @@ def scan_file(data: dict, db: Session = Depends(get_db), current_user: User = De
 
     if risk_score >= 60:
         threat_level, recommendation = "threat", "block"
-        summary = "This file shows high-risk indicators. Do not open it."
+        summary = "This file shows high-risk indicators."
     elif risk_score >= 25:
         threat_level, recommendation = "suspicious", "quarantine"
-        summary = "This file has suspicious characteristics. Scan before opening."
+        summary = "This file has suspicious characteristics."
     else:
         threat_level, recommendation = "safe", "allow"
-        summary = "No significant threats detected in this file."
+        summary = "No significant threats detected."
 
     return {
         "success": True,
@@ -298,8 +274,6 @@ def scan_file(data: dict, db: Session = Depends(get_db), current_user: User = De
         "summary": summary
     }
 
-
-# ---- API Keys ----
 
 @router.get("/apikeys")
 def get_api_keys(current_user: User = Depends(get_current_user)):
@@ -324,9 +298,6 @@ def generate_api_key(data: dict, current_user: User = Depends(get_current_user))
     }
 
 
-# ---- Enhanced IP endpoints (using threat_intel service) ----
-# Note: These override the basic check_ip above. Make sure your router registration order is correct.
-
 @router.post("/ip/enhanced")
 def check_ip_enhanced(data: dict, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     ip = data.get("ip", "").strip()
@@ -334,3 +305,26 @@ def check_ip_enhanced(data: dict, db: Session = Depends(get_db), current_user: U
         raise HTTPException(status_code=400, detail="IP address is required")
     result = aggregate_ip_intel(ip)
     return result
+
+
+@router.post("/url/enhanced")
+def analyze_url_enhanced(data: dict, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    url = data.get("url", "").strip()
+    if not url:
+        raise HTTPException(status_code=400, detail="URL is required")
+
+    if not url.startswith(("http://", "https://")):
+        url = "http://" + url
+
+    result = analyze_threat(
+        content=url,
+        content_type="url",
+        sender="",
+        subject="",
+        conversation_history=[]
+    )
+
+    if not result["success"]:
+        raise HTTPException(status_code=500, detail="Enhanced URL analysis failed")
+
+    return result["analysis"]
