@@ -157,6 +157,12 @@ def _save_analysis(request: EmailAnalysisRequest, analysis: dict, db: Session, c
 
     return db_analysis
 
+def is_valid_email(email: str) -> bool:
+    return bool(re.match(r"[^@]+@[^@]+\.[^@]+", email))
+
+def is_valid_phone(phone: str) -> bool:
+    return bool(re.match(r"^\+?[0-9]{7,15}$", phone))
+
 
 @router.post("/analyze", response_model=dict)
 def analyze_message(
@@ -164,28 +170,103 @@ def analyze_message(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    # Check scan limit before analysis
+    # =====================
+    # VALIDATION (CRITICAL)
+    # =====================
+    if request.channel == "email":
+        if not request.sender:
+            raise HTTPException(status_code=400, detail="Sender email is required")
+        if not is_valid_email(request.sender):
+            raise HTTPException(status_code=400, detail="Invalid email format")
+
+    if request.channel in ["sms", "whatsapp"]:
+        if not request.phone_number:
+            raise HTTPException(status_code=400, detail="Phone number is required")
+        if not is_valid_phone(request.phone_number):
+            raise HTTPException(status_code=400, detail="Invalid phone number")
+
+    if not request.content or len(request.content.strip()) < 3:
+        raise HTTPException(status_code=400, detail="Content too short")
+
+    # =====================
+    # LIMIT CHECK
+    # =====================
     check_scan_limit(db, current_user.id)
 
-    urls = extract_urls(request.content)
-    conversation_history = []
+    content = request.content.strip()
+    urls = extract_urls(content)
 
+    sender_value = request.sender or request.phone_number or ""
+    missing_identity = not sender_value
+
+    # =====================
+    # AI ANALYSIS
+    # =====================
     result = analyze_threat(
-        content=request.content,
+        content=content,
         content_type=request.channel,
-        sender=request.sender or request.phone_number or "",
+        sender=sender_value,
         subject=request.subject or "",
-        conversation_history=conversation_history
+        conversation_history=[]
     )
 
     if not result["success"]:
-        raise HTTPException(status_code=500, detail=result.get("error", "Analysis failed"))
+        raise HTTPException(status_code=500, detail="Analysis failed")
 
     analysis = result["analysis"]
 
-    sender_for_sig = request.sender or request.phone_number or ""
-    threat_signature = generate_threat_signature(analysis, sender_for_sig, urls)
-    related_threats = find_related_threats(db, current_user.id, threat_signature, urls, sender_for_sig)
+    # =====================
+    # 🔥 ZERO TRUST LOGIC
+    # =====================
+    risk_score = 0
+
+    if missing_identity:
+        risk_score += 30
+
+    if urls:
+        risk_score += 20
+
+    if analysis["threat_level"] == "threat":
+        risk_score += 50
+    elif analysis["threat_level"] == "suspicious":
+        risk_score += 25
+
+    if len(content) < 10:
+        risk_score += 10
+
+    # =====================
+    # FINAL DECISION
+    # =====================
+    if risk_score >= 60:
+        final_level = "threat"
+    elif risk_score >= 30:
+        final_level = "suspicious"
+    else:
+        final_level = "safe"
+
+    # override AI if needed
+    analysis["threat_level"] = final_level
+    analysis["confidence"] = min(100, max(40, risk_score))
+
+    if missing_identity:
+        analysis["summary"] += " | ⚠ Missing sender/phone"
+
+    # =====================
+    # SIGNATURE + DB
+    # =====================
+    threat_signature = generate_threat_signature(
+        analysis,
+        sender_value,
+        urls
+    )
+
+    related_threats = find_related_threats(
+        db,
+        current_user.id,
+        threat_signature,
+        urls,
+        sender_value
+    )
 
     update_threat_signature(
         db,
@@ -198,19 +279,17 @@ def analyze_message(
     db_analysis = _save_analysis(request, analysis, db, current_user)
 
     for related in related_threats:
-        propagation = ThreatPropagation(
+        db.add(ThreatPropagation(
             threat_signature=threat_signature,
             source_analysis_id=related["id"],
             target_analysis_id=db_analysis.id,
             propagation_type="same_threat",
             user_id=current_user.id
-        )
-        db.add(propagation)
+        ))
 
     db.commit()
     db.refresh(db_analysis)
 
-    # Update scan usage after successful analysis
     increment_scan_usage(db, current_user.id)
 
     return {
@@ -218,16 +297,9 @@ def analyze_message(
         "id": db_analysis.id,
         "threat_level": analysis["threat_level"],
         "confidence": analysis["confidence"],
-        "threat_type": analysis.get("threat_type", "unknown"),
         "summary": analysis["summary"],
-        "explanation_hebrew": analysis.get("explanation_hebrew", ""),
-        "indicators": analysis.get("indicators", []),
-        "recommendation": analysis.get("recommendation", "allow"),
-        "recommendation_hebrew": analysis.get("recommendation_hebrew", ""),
+        "risk_score": risk_score,  # 🔥 NEW!
         "is_quarantined": db_analysis.is_quarantined,
-        "hijack_detected": analysis.get("hijack_detected", False),
-        "writing_style_change": analysis.get("writing_style_change", False),
-        "suspicious_domain": analysis.get("suspicious_domain", False),
         "channel": request.channel,
         "related_threats_count": len(related_threats)
     }
