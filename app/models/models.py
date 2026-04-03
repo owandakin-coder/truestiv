@@ -183,6 +183,18 @@ class ThreatSignature(Base):
     first_seen = Column(DateTime(timezone=True), server_default=func.now())
     last_seen = Column(DateTime(timezone=True), onupdate=func.now())
 
+class CommunityThreat(Base):
+    __tablename__ = "community_threats"
+
+    id = Column(Integer, primary_key=True, index=True)
+    threat_type = Column(String(50), index=True, nullable=False)
+    indicator = Column(String(500), index=True, nullable=False)
+    risk_score = Column(Integer)
+    threat_level = Column(String(20))
+    source_analysis_id = Column(Integer, ForeignKey("email_analyses.id"), nullable=True)
+    published_by = Column(Integer, ForeignKey("users.id"))
+    raw_intel = Column(JSON, default=list)
+    published_at = Column(DateTime(timezone=True), server_default=func.now())
 
 # ======================
 # BILLING MODELS
