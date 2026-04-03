@@ -421,6 +421,29 @@ def analyze_message(
     # 8. USAGE TRACKING
     increment_scan_usage(db, current_user.id)
 
+       # Auto-publish to community if threat is significant
+    if analysis["threat_level"] in ["threat", "suspicious"]:
+        try:
+            # Extract first URL or use sender/phone as indicator
+            indicator = urls[0] if urls else (request.sender or request.phone_number or "")
+            threat_type = "url" if urls else ("email" if request.channel == "email" else "phone")
+            publish_url = f"{settings.BASE_URL}/api/community/publish-threat"  # או hard-coded לצורך פיתוח
+            headers = {"Authorization": f"Bearer {request.headers.get('authorization', '').replace('Bearer ', '')}"}
+            requests.post(
+                publish_url,
+                json={
+                    "threat_type": threat_type,
+                    "indicator": indicator,
+                    "risk_score": risk_score,
+                    "threat_level": analysis["threat_level"],
+                    "analysis_id": db_analysis.id
+                },
+                headers=headers,
+                timeout=2
+            )
+        except Exception as e:
+            print(f"Auto-publish failed: {e}") 
+
     # 9. RESPONSE (ENGLISH ONLY)
     return {
         "success": True,
