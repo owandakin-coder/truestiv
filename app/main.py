@@ -4,6 +4,7 @@ from app.core.database import engine
 from app.models.models import Base
 from app.routers import auth, analysis, trust, community, scanner
 from app.core.billing import seed_plans
+from app.routers import analysis
 
 # Create database tables
 Base.metadata.create_all(bind=engine)
@@ -18,7 +19,7 @@ app = FastAPI(
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://truestiv-frontend.vercel.app", "http://localhost:5000", "http://localhost:5173","https://truestiv-frontend-5i26o56kp-true-t.vercel.app"],
+    allow_origins=["https://truestiv-frontend.vercel.app", "http://localhost:5000", "http://localhost:5173","https://truestiv-frontend-5i26o56kp-true-t.vercel.app" ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
