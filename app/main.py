@@ -18,7 +18,7 @@ app = FastAPI(
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost:5000", "http://localhost:5173","https://truestiv-frontend-5i26o56kp-true-t.vercel.app"],
+    allow_origins=["https://truestiv-frontend.vercel.app", "http://localhost:5000", "http://localhost:5173","https://truestiv-frontend-5i26o56kp-true-t.vercel.app"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
