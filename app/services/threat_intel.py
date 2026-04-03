@@ -1,4 +1,5 @@
 import requests
+import base64
 from app.core.config import settings
 from typing import Dict, Any
 
@@ -7,7 +8,6 @@ ABUSEIPDB_KEY = settings.ABUSEIPDB_API_KEY
 GREYNOISE_KEY = settings.GREYNOISE_API_KEY
 
 def get_ip_geo(ip: str) -> Dict[str, Any]:
-    """שירות חינמי לקבלת מיקום גיאוגרפי וספק רשת (ip-api.com)"""
     try:
         response = requests.get(f"http://ip-api.com/json/{ip}", timeout=3)
         if response.status_code == 200:
@@ -29,7 +29,6 @@ def get_ip_geo(ip: str) -> Dict[str, Any]:
     return {"country": "Unknown", "isp": "Unknown", "org": "Unknown", "as": "Unknown"}
 
 def check_virustotal(ip: str) -> Dict[str, Any]:
-    """בדיקה מול VirusTotal"""
     if not VIRUSTOTAL_KEY:
         return {"source": "VirusTotal", "error": "Missing API key"}
     url = f"https://www.virustotal.com/api/v3/ip_addresses/{ip}"
@@ -52,14 +51,13 @@ def check_virustotal(ip: str) -> Dict[str, Any]:
                 "country": data.get("country", "Unknown"),
                 "as_owner": data.get("as_owner", ""),
                 "network": data.get("network", ""),
-                "whois": data.get("whois", "")[:500]  # קיצור
+                "whois": data.get("whois", "")[:500]
             }
         return {"source": "VirusTotal", "error": f"HTTP {response.status_code}"}
     except Exception as e:
         return {"source": "VirusTotal", "error": str(e)}
 
 def check_abuseipdb(ip: str) -> Dict[str, Any]:
-    """בדיקה מול AbuseIPDB"""
     if not ABUSEIPDB_KEY:
         return {"source": "AbuseIPDB", "error": "No API key configured"}
     url = "https://api.abuseipdb.com/api/v2/check"
@@ -84,7 +82,6 @@ def check_abuseipdb(ip: str) -> Dict[str, Any]:
         return {"source": "AbuseIPDB", "error": str(e)}
 
 def check_greynoise(ip: str) -> Dict[str, Any]:
-    """בדיקה מול GreyNoise (Community)"""
     if not GREYNOISE_KEY:
         return {"source": "GreyNoise", "error": "No API key configured"}
     url = f"https://api.greynoise.io/v3/community/{ip}"
@@ -110,11 +107,9 @@ def check_greynoise(ip: str) -> Dict[str, Any]:
         return {"source": "GreyNoise", "error": str(e)}
 
 def aggregate_ip_intel(ip: str) -> Dict[str, Any]:
-    """מריץ את כל הבדיקות ומחזיר ניקוד מאוחד + פרטים מלאים"""
     geo = get_ip_geo(ip)
     results = []
     
-    # תמיד נוסיף מידע גיאוגרפי
     geo_source = {
         "source": "IP Geolocation (ip-api.com)",
         "country": geo.get("country"),
@@ -129,7 +124,6 @@ def aggregate_ip_intel(ip: str) -> Dict[str, Any]:
     }
     results.append(geo_source)
     
-    # שאר המקורות
     vt = check_virustotal(ip)
     if vt.get("score") is not None:
         results.append(vt)
@@ -142,11 +136,9 @@ def aggregate_ip_intel(ip: str) -> Dict[str, Any]:
         if gn.get("score") is not None:
             results.append(gn)
     
-    # חישוב ניקוד ממוצע (רק ממקורות שהחזירו score)
     scores = [r["score"] for r in results if "score" in r and not r.get("error")]
     avg_score = sum(scores) // len(scores) if scores else 0
     
-    # קביעת רמת איום
     if avg_score >= 60:
         threat_level = "threat"
         recommendation = "block"
@@ -157,7 +149,6 @@ def aggregate_ip_intel(ip: str) -> Dict[str, Any]:
         threat_level = "safe"
         recommendation = "allow"
     
-    # אספקת פרטים מובילים (מהתוצאות)
     main_isp = geo.get("isp") or next((r.get("isp") for r in results if r.get("isp")), "Unknown")
     main_country = geo.get("country") or next((r.get("country") for r in results if r.get("country")), "Unknown")
     main_as = geo.get("as") or next((r.get("as_owner") for r in results if r.get("as_owner")), "")
@@ -179,6 +170,92 @@ def aggregate_ip_intel(ip: str) -> Dict[str, Any]:
             "longitude": geo.get("lon")
         },
         "sources": results,
-        "summary": f"IP analyzed across {len(results)} intelligence sources.",
-        "summary_hebrew": f"ה-IP נותח מול {len(results)} מקורות מודיעין."
+        "summary": f"IP analyzed across {len(results)} intelligence sources."
+    }
+
+
+def check_virustotal_url(url: str) -> Dict[str, Any]:
+    if not VIRUSTOTAL_KEY:
+        return {"source": "VirusTotal", "error": "Missing API key"}
+    
+    url_id = base64.urlsafe_b64encode(url.encode()).decode().strip("=")
+    api_url = f"https://www.virustotal.com/api/v3/urls/{url_id}"
+    headers = {"x-apikey": VIRUSTOTAL_KEY}
+    try:
+        response = requests.get(api_url, headers=headers, timeout=5)
+        if response.status_code == 200:
+            data = response.json()["data"]["attributes"]
+            stats = data.get("last_analysis_stats", {})
+            malicious = stats.get("malicious", 0)
+            suspicious = stats.get("suspicious", 0)
+            total = stats.get("total", 1)
+            score = min(100, int((malicious + suspicious) / total * 100))
+            return {
+                "source": "VirusTotal",
+                "score": score,
+                "malicious_votes": malicious,
+                "suspicious_votes": suspicious,
+                "harmless_votes": stats.get("harmless", 0),
+                "url": url,
+                "title": data.get("title", ""),
+            }
+        return {"source": "VirusTotal", "error": f"HTTP {response.status_code}"}
+    except Exception as e:
+        return {"source": "VirusTotal", "error": str(e)}
+
+def check_urlscan_io(url: str) -> Dict[str, Any]:
+    try:
+        search_url = f"https://urlscan.io/api/v1/search/?q={url}"
+        resp = requests.get(search_url, timeout=5)
+        if resp.status_code == 200:
+            data = resp.json()
+            results = data.get("results", [])
+            if results:
+                latest = results[0]
+                malicious = latest.get("malicious", False)
+                score = 85 if malicious else 15
+                return {
+                    "source": "urlscan.io",
+                    "score": score,
+                    "malicious": malicious,
+                    "url": url,
+                    "screenshot": latest.get("screenshot"),
+                    "page_domain": latest.get("page", {}).get("domain"),
+                }
+        return {"source": "urlscan.io", "error": "No results or error"}
+    except Exception as e:
+        return {"source": "urlscan.io", "error": str(e)}
+
+def aggregate_url_intel(url: str) -> Dict[str, Any]:
+    results = []
+    
+    vt = check_virustotal_url(url)
+    if vt.get("score") is not None:
+        results.append(vt)
+    
+    us = check_urlscan_io(url)
+    if us.get("score") is not None:
+        results.append(us)
+    
+    scores = [r["score"] for r in results if "score" in r and not r.get("error")]
+    avg_score = sum(scores) // len(scores) if scores else 0
+    
+    if avg_score >= 60:
+        threat_level = "threat"
+        recommendation = "block"
+    elif avg_score >= 25:
+        threat_level = "suspicious"
+        recommendation = "quarantine"
+    else:
+        threat_level = "safe"
+        recommendation = "allow"
+    
+    return {
+        "success": True,
+        "url": url,
+        "threat_level": threat_level,
+        "aggregated_score": avg_score,
+        "recommendation": recommendation,
+        "sources": results,
+        "summary": f"URL analyzed across {len(results)} intelligence sources."
     }
