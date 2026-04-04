@@ -2,6 +2,8 @@ import requests
 import base64
 from app.core.config import settings
 from typing import Dict, Any
+from tenacity import retry, stop_after_attempt, wait_exponential
+import redis
 
 VIRUSTOTAL_KEY = settings.VIRUSTOTAL_API_KEY
 ABUSEIPDB_KEY = settings.ABUSEIPDB_API_KEY
@@ -298,3 +300,15 @@ def aggregate_url_intel(url: str) -> Dict[str, Any]:
         "sources": results,
         "summary": f"URL analyzed across {len(results)} intelligence sources."
     }
+cache = redis.Redis(...)
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
+def fetch_otx_indicator(indicator):
+    key = f"otx:{indicator}"
+    cached = cache.get(key)
+    if cached:
+        return json.loads(cached)
+    resp = requests.get(f"https://otx.alienvault.com/api/v1/indicators/...", headers={"X-OTX-API-KEY": settings.OTX_KEY})
+    data = resp.json()
+    cache.set(key, json.dumps(data), ex=300)
+    return data
