@@ -386,27 +386,7 @@ def analyze_message(
 
     increment_scan_usage(db, current_user.id)
 
-    if analysis["threat_level"] in ["threat", "suspicious"]:
-        try:
-            indicator = urls[0] if urls else (request.sender or request.phone_number or "")
-            threat_type = "url" if urls else ("email" if request.channel == "email" else "phone")
-            base_url = settings.BASE_URL
-            publish_url = f"{base_url}/api/community/publish-threat"
-            headers = {"Authorization": f"Bearer {request.headers.get('authorization', '').replace('Bearer ', '')}"}
-            requests.post(
-                publish_url,
-                json={
-                    "threat_type": threat_type,
-                    "indicator": indicator,
-                    "risk_score": risk_score,
-                    "threat_level": analysis["threat_level"],
-                    "analysis_id": db_analysis.id
-                },
-                headers=headers,
-                timeout=2
-            )
-        except Exception as e:
-            print(f"Auto-publish failed: {e}")
+    # Auto-publish to community removed temporarily to avoid BASE_URL error
 
     return {
         "success": True,
@@ -477,9 +457,3 @@ def threat_clusters(db: Session = Depends(get_db), current_user: User = Depends(
         clusters[key] = clusters.get(key, 0) + 1
 
     return clusters
-
-# ------------------------------
-# 7. OTHER ENDPOINTS (history, threads, stats, etc.)
-# ------------------------------
-# (Keep your existing endpoints for /history, /threads, /stats, /propagation-map, /threat-clusters exactly as they are)
-# ... (no changes needed there)
