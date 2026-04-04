@@ -137,3 +137,17 @@ def get_community_threats(db: Session = Depends(get_db), current_user: User = De
         }
         for t in threats
     ]
+
+@router.post("/{threat_id}/like", status_code=200)
+def like_threat(threat_id: int, db: Session = Depends(get_db), user=Depends(get_current_user)):
+    # upsert like
+    existing = db.query(CommunityLike).filter_by(threat_id=threat_id, user_id=user.id).first()
+    if existing:
+        db.delete(existing)
+        db.query(CommunityThreat).filter_by(id=threat_id).update({"likes_count": CommunityThreat.likes_count - 1})
+        db.commit()
+        return {"liked": False}
+    db.add(CommunityLike(threat_id=threat_id, user_id=user.id))
+    db.query(CommunityThreat).filter_by(id=threat_id).update({"likes_count": CommunityThreat.likes_count + 1})
+    db.commit()
+    return {"liked": True}
