@@ -1,5 +1,6 @@
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
+from sqlalchemy import desc
 from app.core.database import get_db
 from app.core.auth import get_current_user
 from app.models.models import User, CommunityThreat, EmailAnalysis
@@ -10,41 +11,45 @@ router = APIRouter()
 def get_notifications(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
-    limit: int = 20
+    limit: int = 30
 ):
-    threats = db.query(CommunityThreat).filter(
+    # 
+    community_threats = db.query(CommunityThreat).filter(
         CommunityThreat.published_by != current_user.id
-    ).order_by(CommunityThreat.published_at.desc()).limit(10).all()
-
-    analyses = db.query(EmailAnalysis).filter(
+    ).order_by(desc(CommunityThreat.published_at)).limit(limit // 2).all()
+    
+    # 
+    own_analyses = db.query(EmailAnalysis).filter(
         EmailAnalysis.user_id == current_user.id,
         EmailAnalysis.threat_level.in_(["threat", "suspicious"])
-    ).order_by(EmailAnalysis.created_at.desc()).limit(10).all()
-
+    ).order_by(desc(EmailAnalysis.created_at)).limit(limit // 2).all()
+    
     notifications = []
-
-    for t in threats:
+    
+    for ct in community_threats:
         notifications.append({
-            "id": t.id,
+            "id": f"comm_{ct.id}",
             "type": "community",
             "title": "Community Threat",
-            "message": f"New {t.threat_type} reported: {t.indicator}",
-            "time": t.published_at.isoformat(),
+            "message": f"{ct.threat_type.upper()}: {ct.indicator[:50]}",
+            "time": ct.published_at.isoformat(),
             "read": False,
-            "color": "#3b82f6"
+            "color": "#3b82f6",
+            "icon": "globe"
         })
-
-    for a in analyses:
+    
+    for an in own_analyses:
         notifications.append({
-            "id": a.id,
+            "id": f"analysis_{an.id}",
             "type": "threat",
             "title": "Threat Detected",
-            "message": a.summary[:100] if a.summary else "",
-            "time": a.created_at.isoformat(),
+            "message": an.summary[:100] if an.summary else f"{an.threat_type} from {an.sender or an.phone_number}",
+            "time": an.created_at.isoformat(),
             "read": False,
-            "color": "#ff3b3b"
+            "color": "#ff3b3b",
+            "icon": "alert"
         })
-
+    
+    #   
     notifications.sort(key=lambda x: x["time"], reverse=True)
-
     return notifications[:limit]
