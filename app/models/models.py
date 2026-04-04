@@ -5,7 +5,33 @@ from sqlalchemy import (
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 from app.core.database import Base
+from sqlalchemy import Column, Integer, String, Boolean, ForeignKey, DateTime, JSON, func
 
+class Notification(Base):
+    __tablename__ = "notifications"
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
+    threat_id = Column(Integer, ForeignKey("community_threats.id"), nullable=True)
+    source = Column(String, index=True)
+    title = Column(String)
+    body = Column(String)
+    severity = Column(String, default="info")
+    read = Column(Boolean, default=False)
+    metadata = Column(JSON, default={})
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+class CommunityThreat(Base):
+    __tablename__ = "community_threats"
+    id = Column(Integer, primary_key=True, index=True)
+    signature = Column(String, unique=True, index=True)
+    title = Column(String)
+    description = Column(String)
+    published_by = Column(Integer, ForeignKey("users.id"))
+    likes_count = Column(Integer, default=0)
+    comments_count = Column(Integer, default=0)
+    score = Column(Integer, default=0)
+    is_moderated = Column(Boolean, default=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 # ======================
 # USER
