@@ -1,114 +1,49 @@
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from sqlalchemy import desc
 from app.core.database import get_db
 from app.core.auth import get_current_user
 from app.models.models import User, CommunityThreat, EmailAnalysis
+from typing import List, Dict, Any
 
+router = APIRouter(tags=["Notifications"])
 
-@router.get("/")
-def get_notifications(
-    db: Session = Depends(get_db),
-    current_user = Depends(get_current_user),
-    skip: int = 0,
-    limit: int = 25
-):
-    # Combine community threats and own analyses
-    community_alerts = db.query(CommunityThreat).filter(
-        CommunityThreat.published_by != current_user.id,
-        CommunityThreat.is_moderated == False
-    ).order_by(desc(CommunityThreat.published_at)).limit(limit).all()
-    
-    own_threats = db.query(EmailAnalysis).filter(
-        EmailAnalysis.user_id == current_user.id,
-        EmailAnalysis.threat_level.in_(["threat", "suspicious"])
-    ).order_by(desc(EmailAnalysis.created_at)).limit(limit).all()
-    
-    items = []
-    for ct in community_alerts:
-        items.append({
-            "id": f"comm_{ct.id}",
-            "type": "community",
-            "title": f"Community {ct.threat_type.upper()} Threat",
-            "message": f"{ct.indicator[:80]}",
-            "time": ct.published_at.isoformat(),
-            "read": False,
-            "color": "#3b82f6",
-            "icon": "globe"
-        })
-    
-    for an in own_threats:
-        items.append({
-            "id": f"analysis_{an.id}",
-            "type": "threat",
-            "title": "Threat Detected",
-            "message": an.summary[:100] if an.summary else f"{an.threat_type} from {an.sender or an.phone_number}",
-            "time": an.created_at.isoformat(),
-            "read": False,
-            "color": "#ff3b3b",
-            "icon": "alert"
-        })
-    
-    items.sort(key=lambda x: x["time"], reverse=True)
-    return {"total": len(items), "items": items[:limit]}
-
-@router.post("/{notification_id}/read")
-def mark_read(notification_id: str, db: Session = Depends(get_db), current_user = Depends(get_current_user)):
-    # Since we have compound IDs, we need to parse or use a different approach.
-    # For simplicity, we can mark all as read for this user? Or store read status per user.
-    # Better: create a UserNotificationRead table. But for now, return success.
-    return {"success": True}
-
-router = APIRouter(prefix="/api/notifications", tags=["Notifications"])
-
-@router.get("/", response_model=List[NotificationOut])
-def list_notifications(skip: int = 0, limit: int = 25, db: Session = Depends(get_db), user=Depends(get_current_user)):
-    q = db.query(Notification).filter(Notification.user_id == user.id).order_by(Notification.created_at.desc())
-    total = q.count()
-    items = q.offset(skip).limit(limit).all()
-    return {"total": total, "items": items}
-
-@router.post("/{id}/read", status_code=204)
-def mark_read(id: int, db: Session = Depends(get_db), user=Depends(get_current_user)):
-    n = db.query(Notification).filter(Notification.id == id, Notification.user_id == user.id).first()
-    if n:
-        n.read = True
-        db.commit()
-
-
-router = APIRouter()
 
 @router.get("/")
 def get_notifications(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
     limit: int = 30
-):
-    # 
+) -> Dict[str, Any]:
+    """
+    Get combined notifications from community threats and user's own threat analyses.
+    """
+    # Community threats published by others
     community_threats = db.query(CommunityThreat).filter(
-        CommunityThreat.published_by != current_user.id
+        CommunityThreat.published_by != current_user.id,
+        CommunityThreat.is_moderated == False
     ).order_by(desc(CommunityThreat.published_at)).limit(limit // 2).all()
-    
-    # 
+
+    # User's own threat analyses
     own_analyses = db.query(EmailAnalysis).filter(
         EmailAnalysis.user_id == current_user.id,
         EmailAnalysis.threat_level.in_(["threat", "suspicious"])
     ).order_by(desc(EmailAnalysis.created_at)).limit(limit // 2).all()
-    
+
     notifications = []
-    
+
     for ct in community_threats:
         notifications.append({
             "id": f"comm_{ct.id}",
             "type": "community",
-            "title": "Community Threat",
-            "message": f"{ct.threat_type.upper()}: {ct.indicator[:50]}",
+            "title": f"Community {ct.threat_type.upper()} Threat",
+            "message": ct.indicator[:100] if ct.indicator else "New threat reported",
             "time": ct.published_at.isoformat(),
-            "read": False,
+            "read": False,  # TODO: store read status per user in separate table
             "color": "#3b82f6",
             "icon": "globe"
         })
-    
+
     for an in own_analyses:
         notifications.append({
             "id": f"analysis_{an.id}",
@@ -120,7 +55,23 @@ def get_notifications(
             "color": "#ff3b3b",
             "icon": "alert"
         })
-    
-    #   
+
+    # Sort by most recent first
     notifications.sort(key=lambda x: x["time"], reverse=True)
-    return notifications[:limit]
+    return {"total": len(notifications), "items": notifications[:limit]}
+
+
+@router.post("/{notification_id}/read")
+def mark_notification_read(
+    notification_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+) -> Dict[str, Any]:
+    """
+    Mark a specific notification as read.
+    Since we don't have a persistent read status table yet, we just return success.
+    For production, you'd store read status in a UserNotificationRead table.
+    """
+    # TODO: Implement persistent read status (e.g., UserNotificationRead model)
+    # For now, always return success (frontend will manage read state locally)
+    return {"success": True, "message": f"Notification {notification_id} marked as read (locally)"}
