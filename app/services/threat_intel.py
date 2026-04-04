@@ -1,13 +1,21 @@
 import requests
 import base64
-from app.core.config import settings
+import json
 from typing import Dict, Any
 from tenacity import retry, stop_after_attempt, wait_exponential
-import redis
+from app.core.config import settings
+
+# Optional Redis cache (if REDIS_URL is configured)
+try:
+    import redis
+    redis_client = redis.from_url(settings.REDIS_URL) if hasattr(settings, "REDIS_URL") and settings.REDIS_URL else None
+except Exception:
+    redis_client = None
 
 VIRUSTOTAL_KEY = settings.VIRUSTOTAL_API_KEY
 ABUSEIPDB_KEY = settings.ABUSEIPDB_API_KEY
 GREYNOISE_KEY = settings.GREYNOISE_API_KEY
+OTX_KEY = getattr(settings, "OTX_API_KEY", "")
 
 
 def get_ip_geo(ip: str) -> Dict[str, Any]:
@@ -133,6 +141,44 @@ def check_greynoise(ip: str) -> Dict[str, Any]:
         return {"source": "GreyNoise", "error": str(e)}
 
 
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
+def fetch_otx_indicator(indicator: str, indicator_type: str = "IPv4") -> Dict[str, Any]:
+    """Fetch threat intelligence from AlienVault OTX."""
+    if not OTX_KEY:
+        return {"source": "OTX", "error": "Missing API key"}
+
+    cache_key = f"otx:{indicator_type}:{indicator}"
+    if redis_client:
+        cached = redis_client.get(cache_key)
+        if cached:
+            return json.loads(cached)
+
+    url = f"https://otx.alienvault.com/api/v1/indicators/{indicator_type}/{indicator}/general"
+    headers = {"X-OTX-API-KEY": OTX_KEY}
+    try:
+        response = requests.get(url, headers=headers, timeout=5)
+        if response.status_code == 200:
+            data = response.json()
+            reputation = data.get("reputation")
+            pulse_count = data.get("pulse_info", {}).get("count", 0)
+            score = 70 if reputation == "malicious" else 30 if pulse_count > 0 else 0
+
+            result = {
+                "source": "AlienVault OTX",
+                "score": score,
+                "reputation": reputation,
+                "pulse_count": pulse_count,
+                "country": data.get("country_code", ""),
+                "asn": data.get("asn", "")
+            }
+            if redis_client:
+                redis_client.setex(cache_key, 300, json.dumps(result))
+            return result
+        return {"source": "OTX", "error": f"HTTP {response.status_code}"}
+    except Exception as e:
+        return {"source": "OTX", "error": str(e)}
+
+
 def aggregate_ip_intel(ip: str) -> Dict[str, Any]:
     geo = get_ip_geo(ip)
     results = []
@@ -164,6 +210,11 @@ def aggregate_ip_intel(ip: str) -> Dict[str, Any]:
         gn = check_greynoise(ip)
         if gn.get("score") is not None:
             results.append(gn)
+
+    # OTX enrichment
+    otx = fetch_otx_indicator(ip, "IPv4")
+    if otx.get("score") is not None:
+        results.append(otx)
 
     scores = [r["score"] for r in results if "score" in r and not r.get("error")]
     avg_score = sum(scores) // len(scores) if scores else 0
@@ -300,15 +351,3 @@ def aggregate_url_intel(url: str) -> Dict[str, Any]:
         "sources": results,
         "summary": f"URL analyzed across {len(results)} intelligence sources."
     }
-cache = redis.Redis(...)
-
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
-def fetch_otx_indicator(indicator):
-    key = f"otx:{indicator}"
-    cached = cache.get(key)
-    if cached:
-        return json.loads(cached)
-    resp = requests.get(f"https://otx.alienvault.com/api/v1/indicators/...", headers={"X-OTX-API-KEY": settings.OTX_KEY})
-    data = resp.json()
-    cache.set(key, json.dumps(data), ex=300)
-    return data
