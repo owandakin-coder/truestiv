@@ -4,7 +4,7 @@ import socket
 import requests
 import base64
 from datetime import datetime, timedelta
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from sqlalchemy.orm import Session
 from sqlalchemy import desc, text
 from app.core.database import get_db
@@ -261,9 +261,31 @@ def _save_analysis(request: EmailAnalysisRequest, analysis: dict, db: Session, c
     db.flush()
     return db_analysis
 
+# Helper for auto-publish (non-blocking)
+def _publish_threat_background(indicator: str, threat_type: str, risk_score: int, threat_level: str, analysis_id: int, token: str):
+    try:
+        base_url = "https://trustiveai.onrender.com"  # או השתמש במשתנה סביבה
+        url = f"{base_url}/api/community/publish-threat"
+        headers = {"Authorization": f"Bearer {token}"}
+        requests.post(
+            url,
+            json={
+                "threat_type": threat_type,
+                "indicator": indicator,
+                "risk_score": risk_score,
+                "threat_level": threat_level,
+                "analysis_id": analysis_id
+            },
+            headers=headers,
+            timeout=2
+        )
+    except Exception as e:
+        print(f"Background auto-publish failed: {e}")
+
 @router.post("/analyze", response_model=dict)
 def analyze_message(
     request: EmailAnalysisRequest,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
@@ -386,7 +408,21 @@ def analyze_message(
 
     increment_scan_usage(db, current_user.id)
 
-    # Auto-publish to community removed temporarily to avoid BASE_URL error
+    # Auto-publish to community (non-blocking)
+    if analysis["threat_level"] in ["threat", "suspicious"]:
+        indicator = urls[0] if urls else (request.sender or request.phone_number or "")
+        threat_type = "url" if urls else ("email" if request.channel == "email" else "phone")
+        auth_header = request.headers.get("authorization", "")
+        token = auth_header.replace("Bearer ", "")
+        background_tasks.add_task(
+            _publish_threat_background,
+            indicator,
+            threat_type,
+            risk_score,
+            analysis["threat_level"],
+            db_analysis.id,
+            token
+        )
 
     return {
         "success": True,
@@ -403,21 +439,64 @@ def analyze_message(
         "risk_score": risk_score,
     }
 
-@router.get("/propagation-map")
-def propagation_map(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    records = db.query(ThreatPropagation).order_by(ThreatPropagation.created_at.desc()).limit(200).all()
+# ----------------------
+# MISSING ENDPOINTS
+# ----------------------
+@router.get("/history")
+def get_history(db: Session = Depends(get_db), current_user: User = Depends(get_current_user), limit: int = 50):
+    analyses = db.query(EmailAnalysis).filter(
+        EmailAnalysis.user_id == current_user.id
+    ).order_by(desc(EmailAnalysis.created_at)).limit(limit).all()
     return [
         {
-            "id": r.id,
-            "source_analysis_id": r.source_analysis_id,
-            "target_analysis_id": r.target_analysis_id,
-            "threat_signature": r.threat_signature,
-            "propagation_type": r.propagation_type,
-            "user_id": r.user_id,
-            "created_at": str(r.created_at)
+            "id": a.id,
+            "subject": a.subject,
+            "sender": a.sender or a.phone_number,
+            "channel": a.channel,
+            "threat_level": a.threat_level,
+            "threat_type": a.threat_type,
+            "confidence": a.confidence,
+            "summary": a.summary,
+            "is_quarantined": a.is_quarantined,
+            "hijack_detected": a.hijack_detected,
+            "created_at": str(a.created_at)
         }
-        for r in records
+        for a in analyses
     ]
+
+@router.get("/propagation-map")
+def get_propagation_map(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    records = db.query(ThreatPropagation).filter(
+        ThreatPropagation.user_id == current_user.id
+    ).order_by(desc(ThreatPropagation.detected_at)).limit(200).all()
+    nodes = {}
+    edges = []
+    for prop in records:
+        if prop.source_analysis_id and prop.source_analysis_id not in nodes:
+            src = db.query(EmailAnalysis).filter(EmailAnalysis.id == prop.source_analysis_id).first()
+            if src:
+                nodes[prop.source_analysis_id] = {
+                    "id": src.id,
+                    "name": src.sender or src.phone_number or "Unknown",
+                    "threat_level": src.threat_level,
+                    "timestamp": str(src.created_at)
+                }
+        if prop.target_analysis_id and prop.target_analysis_id not in nodes:
+            tgt = db.query(EmailAnalysis).filter(EmailAnalysis.id == prop.target_analysis_id).first()
+            if tgt:
+                nodes[prop.target_analysis_id] = {
+                    "id": tgt.id,
+                    "name": tgt.sender or tgt.phone_number or "Unknown",
+                    "threat_level": tgt.threat_level,
+                    "timestamp": str(tgt.created_at)
+                }
+        if prop.source_analysis_id and prop.target_analysis_id:
+            edges.append({
+                "source": prop.source_analysis_id,
+                "target": prop.target_analysis_id,
+                "type": prop.propagation_type
+            })
+    return {"nodes": list(nodes.values()), "edges": edges}
 
 @router.get("/stats")
 def analysis_stats(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
@@ -434,13 +513,7 @@ def analysis_stats(db: Session = Depends(get_db), current_user: User = Depends(g
         EmailAnalysis.user_id == current_user.id,
         EmailAnalysis.threat_level == "safe"
     ).count()
-
-    return {
-        "total": total,
-        "dangerous": dangerous,
-        "suspicious": suspicious,
-        "safe": safe
-    }
+    return {"total": total, "dangerous": dangerous, "suspicious": suspicious, "safe": safe}
 
 @router.get("/threat-clusters")
 def threat_clusters(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
@@ -450,10 +523,8 @@ def threat_clusters(db: Session = Depends(get_db), current_user: User = Depends(
     ).filter(
         EmailAnalysis.user_id == current_user.id
     ).all()
-
     clusters = {}
     for t, lvl in rows:
         key = f"{t}:{lvl}"
         clusters[key] = clusters.get(key, 0) + 1
-
     return clusters
