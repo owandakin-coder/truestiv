@@ -5,33 +5,6 @@ from sqlalchemy import (
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 from app.core.database import Base
-from sqlalchemy import Column, Integer, String, Boolean, ForeignKey, DateTime, JSON, func
-
-class Notification(Base):
-    __tablename__ = "notifications"
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
-    threat_id = Column(Integer, ForeignKey("community_threats.id"), nullable=True)
-    source = Column(String, index=True)
-    title = Column(String)
-    body = Column(String)
-    severity = Column(String, default="info")
-    read = Column(Boolean, default=False)
-    metadata = Column(JSON, default={})
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-
-class CommunityThreat(Base):
-    __tablename__ = "community_threats"
-    id = Column(Integer, primary_key=True, index=True)
-    signature = Column(String, unique=True, index=True)
-    title = Column(String)
-    description = Column(String)
-    published_by = Column(Integer, ForeignKey("users.id"))
-    likes_count = Column(Integer, default=0)
-    comments_count = Column(Integer, default=0)
-    score = Column(Integer, default=0)
-    is_moderated = Column(Boolean, default=False)
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 # ======================
 # USER
@@ -209,12 +182,16 @@ class ThreatSignature(Base):
     first_seen = Column(DateTime(timezone=True), server_default=func.now())
     last_seen = Column(DateTime(timezone=True), onupdate=func.now())
 
+
+# ======================
+# COMMUNITY MODELS
+# ======================
 class CommunityThreat(Base):
     __tablename__ = "community_threats"
 
     id = Column(Integer, primary_key=True, index=True)
-    threat_type = Column(String(50), index=True, nullable=False)
-    indicator = Column(String(500), index=True, nullable=False)
+    threat_type = Column(String(50), index=True, nullable=False)   # ip, url, email
+    indicator = Column(String(500), index=True, nullable=False)    # the actual value
     risk_score = Column(Integer)
     threat_level = Column(String(20))
     source_analysis_id = Column(Integer, ForeignKey("email_analyses.id"), nullable=True)
@@ -222,10 +199,63 @@ class CommunityThreat(Base):
     raw_intel = Column(JSON, default=list)
     published_at = Column(DateTime(timezone=True), server_default=func.now())
 
+    # Engagement fields
+    likes_count = Column(Integer, default=0)
+    comments_count = Column(Integer, default=0)
+    score = Column(Integer, default=0)
+    is_moderated = Column(Boolean, default=False)
+
+    # Optional title/description (can be auto-generated from indicator)
+    title = Column(String, nullable=True)
+    description = Column(String, nullable=True)
+
+
+class Notification(Base):
+    __tablename__ = "notifications"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
+    threat_id = Column(Integer, ForeignKey("community_threats.id"), nullable=True)
+    source = Column(String, index=True)
+    title = Column(String)
+    body = Column(String)
+    severity = Column(String, default="info")
+    read = Column(Boolean, default=False)
+    extra_data = Column(JSON, default={})   # renamed from 'metadata'
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class CommunityComment(Base):
+    __tablename__ = "community_comments"
+
+    id = Column(Integer, primary_key=True, index=True)
+    threat_id = Column(Integer, ForeignKey("community_threats.id"), nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    body = Column(Text, nullable=False)
+    parent_id = Column(Integer, ForeignKey("community_comments.id"), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    edited_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+    # Relationships
+    threat = relationship("CommunityThreat", foreign_keys=[threat_id])
+    user = relationship("User", foreign_keys=[user_id])
+    parent = relationship("CommunityComment", remote_side=[id])
+
+
+class CommunityLike(Base):
+    __tablename__ = "community_likes"
+
+    id = Column(Integer, primary_key=True, index=True)
+    threat_id = Column(Integer, ForeignKey("community_threats.id"), nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (UniqueConstraint('threat_id', 'user_id', name='unique_threat_user_like'),)
+
+
 # ======================
 # BILLING MODELS
 # ======================
-
 class Plan(Base):
     __tablename__ = "plans"
 
