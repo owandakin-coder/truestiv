@@ -4,7 +4,7 @@ import socket
 import requests
 import base64
 from datetime import datetime, timedelta
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Request
 from sqlalchemy.orm import Session
 from sqlalchemy import desc, text
 from app.core.database import get_db
@@ -261,10 +261,9 @@ def _save_analysis(request: EmailAnalysisRequest, analysis: dict, db: Session, c
     db.flush()
     return db_analysis
 
-# Helper for auto-publish (non-blocking)
 def _publish_threat_background(indicator: str, threat_type: str, risk_score: int, threat_level: str, analysis_id: int, token: str):
     try:
-        base_url = "https://trustiveai.onrender.com"  # או השתמש במשתנה סביבה
+        base_url = getattr(settings, "BASE_URL", "https://trustiveai.onrender.com")
         url = f"{base_url}/api/community/publish-threat"
         headers = {"Authorization": f"Bearer {token}"}
         requests.post(
@@ -285,6 +284,7 @@ def _publish_threat_background(indicator: str, threat_type: str, risk_score: int
 @router.post("/analyze", response_model=dict)
 def analyze_message(
     request: EmailAnalysisRequest,
+    http_request: Request,
     background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
@@ -412,7 +412,7 @@ def analyze_message(
     if analysis["threat_level"] in ["threat", "suspicious"]:
         indicator = urls[0] if urls else (request.sender or request.phone_number or "")
         threat_type = "url" if urls else ("email" if request.channel == "email" else "phone")
-        auth_header = request.headers.get("authorization", "")
+        auth_header = http_request.headers.get("authorization", "")
         token = auth_header.replace("Bearer ", "")
         background_tasks.add_task(
             _publish_threat_background,
@@ -440,7 +440,7 @@ def analyze_message(
     }
 
 # ----------------------
-# MISSING ENDPOINTS
+# ENDPOINTS: history, propagation-map, stats, threat-clusters
 # ----------------------
 @router.get("/history")
 def get_history(db: Session = Depends(get_db), current_user: User = Depends(get_current_user), limit: int = 50):
