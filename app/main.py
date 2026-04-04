@@ -4,6 +4,7 @@ from app.core.database import engine
 from app.models.models import Base
 from app.routers import auth, analysis, trust, community, scanner, notifications
 from app.core.billing import seed_plans
+from app.routers import notifications
 
 Base.metadata.create_all(bind=engine)
 
