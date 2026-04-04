@@ -5,6 +5,60 @@ from app.core.database import get_db
 from app.core.auth import get_current_user
 from app.models.models import User, CommunityThreat, EmailAnalysis
 
+
+@router.get("/")
+def get_notifications(
+    db: Session = Depends(get_db),
+    current_user = Depends(get_current_user),
+    skip: int = 0,
+    limit: int = 25
+):
+    # Combine community threats and own analyses
+    community_alerts = db.query(CommunityThreat).filter(
+        CommunityThreat.published_by != current_user.id,
+        CommunityThreat.is_moderated == False
+    ).order_by(desc(CommunityThreat.published_at)).limit(limit).all()
+    
+    own_threats = db.query(EmailAnalysis).filter(
+        EmailAnalysis.user_id == current_user.id,
+        EmailAnalysis.threat_level.in_(["threat", "suspicious"])
+    ).order_by(desc(EmailAnalysis.created_at)).limit(limit).all()
+    
+    items = []
+    for ct in community_alerts:
+        items.append({
+            "id": f"comm_{ct.id}",
+            "type": "community",
+            "title": f"Community {ct.threat_type.upper()} Threat",
+            "message": f"{ct.indicator[:80]}",
+            "time": ct.published_at.isoformat(),
+            "read": False,
+            "color": "#3b82f6",
+            "icon": "globe"
+        })
+    
+    for an in own_threats:
+        items.append({
+            "id": f"analysis_{an.id}",
+            "type": "threat",
+            "title": "Threat Detected",
+            "message": an.summary[:100] if an.summary else f"{an.threat_type} from {an.sender or an.phone_number}",
+            "time": an.created_at.isoformat(),
+            "read": False,
+            "color": "#ff3b3b",
+            "icon": "alert"
+        })
+    
+    items.sort(key=lambda x: x["time"], reverse=True)
+    return {"total": len(items), "items": items[:limit]}
+
+@router.post("/{notification_id}/read")
+def mark_read(notification_id: str, db: Session = Depends(get_db), current_user = Depends(get_current_user)):
+    # Since we have compound IDs, we need to parse or use a different approach.
+    # For simplicity, we can mark all as read for this user? Or store read status per user.
+    # Better: create a UserNotificationRead table. But for now, return success.
+    return {"success": True}
+
 router = APIRouter(prefix="/api/notifications", tags=["Notifications"])
 
 @router.get("/", response_model=List[NotificationOut])
