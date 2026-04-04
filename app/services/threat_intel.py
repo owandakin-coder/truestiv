@@ -5,19 +5,48 @@ from typing import Dict, Any
 from tenacity import retry, stop_after_attempt, wait_exponential
 from app.core.config import settings
 
-# Optional Redis cache (if REDIS_URL is configured)
+# Attempt Redis import gracefully
 try:
     import redis
-    redis_client = redis.from_url(settings.REDIS_URL) if hasattr(settings, "REDIS_URL") and settings.REDIS_URL else None
-except Exception:
-    redis_client = None
+    REDIS_AVAILABLE = True
+except ImportError:
+    REDIS_AVAILABLE = False
+    redis = None
 
 VIRUSTOTAL_KEY = settings.VIRUSTOTAL_API_KEY
 ABUSEIPDB_KEY = settings.ABUSEIPDB_API_KEY
 GREYNOISE_KEY = settings.GREYNOISE_API_KEY
 OTX_KEY = getattr(settings, "OTX_API_KEY", "")
 
+# Redis connection (if available)
+redis_client = None
+if REDIS_AVAILABLE:
+    try:
+        redis_client = redis.Redis(
+            host=settings.REDIS_HOST if hasattr(settings, "REDIS_HOST") else "localhost",
+            port=settings.REDIS_PORT if hasattr(settings, "REDIS_PORT") else 6379,
+            decode_responses=True,
+            socket_timeout=2
+        )
+        redis_client.ping()
+    except Exception:
+        redis_client = None
 
+
+def _cache_get(key: str):
+    if redis_client:
+        return redis_client.get(key)
+    return None
+
+
+def _cache_set(key: str, value: str, ttl: int = 300):
+    if redis_client:
+        redis_client.setex(key, ttl, value)
+
+
+# ------------------------------
+# IP Geolocation
+# ------------------------------
 def get_ip_geo(ip: str) -> Dict[str, Any]:
     try:
         response = requests.get(f"http://ip-api.com/json/{ip}", timeout=3)
@@ -40,9 +69,17 @@ def get_ip_geo(ip: str) -> Dict[str, Any]:
     return {"country": "Unknown", "isp": "Unknown", "org": "Unknown", "as": "Unknown"}
 
 
+# ------------------------------
+# VirusTotal (IP)
+# ------------------------------
 def check_virustotal(ip: str) -> Dict[str, Any]:
     if not VIRUSTOTAL_KEY:
         return {"source": "VirusTotal", "error": "Missing API key"}
+
+    cache_key = f"vt_ip:{ip}"
+    cached = _cache_get(cache_key)
+    if cached:
+        return json.loads(cached)
 
     url = f"https://www.virustotal.com/api/v3/ip_addresses/{ip}"
     headers = {"x-apikey": VIRUSTOTAL_KEY}
@@ -57,7 +94,7 @@ def check_virustotal(ip: str) -> Dict[str, Any]:
             total = stats.get("total", 1)
             score = min(100, int((malicious + suspicious) / total * 100))
 
-            return {
+            result = {
                 "source": "VirusTotal",
                 "score": score,
                 "malicious_votes": malicious,
@@ -68,6 +105,8 @@ def check_virustotal(ip: str) -> Dict[str, Any]:
                 "network": data.get("network", ""),
                 "whois": data.get("whois", "")[:500]
             }
+            _cache_set(cache_key, json.dumps(result), ttl=3600)
+            return result
 
         return {"source": "VirusTotal", "error": f"HTTP {response.status_code}"}
 
@@ -75,9 +114,17 @@ def check_virustotal(ip: str) -> Dict[str, Any]:
         return {"source": "VirusTotal", "error": str(e)}
 
 
+# ------------------------------
+# AbuseIPDB
+# ------------------------------
 def check_abuseipdb(ip: str) -> Dict[str, Any]:
     if not ABUSEIPDB_KEY:
         return {"source": "AbuseIPDB", "error": "No API key configured"}
+
+    cache_key = f"abuseipdb:{ip}"
+    cached = _cache_get(cache_key)
+    if cached:
+        return json.loads(cached)
 
     url = "https://api.abuseipdb.com/api/v2/check"
     headers = {"Key": ABUSEIPDB_KEY, "Accept": "application/json"}
@@ -87,8 +134,7 @@ def check_abuseipdb(ip: str) -> Dict[str, Any]:
         response = requests.get(url, headers=headers, params=params, timeout=5)
         if response.status_code == 200:
             data = response.json()["data"]
-
-            return {
+            result = {
                 "source": "AbuseIPDB",
                 "score": data.get("abuseConfidenceScore", 0),
                 "total_reports": data.get("totalReports", 0),
@@ -98,6 +144,8 @@ def check_abuseipdb(ip: str) -> Dict[str, Any]:
                 "usage_type": data.get("usageType", ""),
                 "categories": [c.get("title") for c in data.get("reports", [])[:5]]
             }
+            _cache_set(cache_key, json.dumps(result), ttl=3600)
+            return result
 
         return {"source": "AbuseIPDB", "error": f"HTTP {response.status_code}"}
 
@@ -105,9 +153,17 @@ def check_abuseipdb(ip: str) -> Dict[str, Any]:
         return {"source": "AbuseIPDB", "error": str(e)}
 
 
+# ------------------------------
+# GreyNoise
+# ------------------------------
 def check_greynoise(ip: str) -> Dict[str, Any]:
     if not GREYNOISE_KEY:
         return {"source": "GreyNoise", "error": "No API key configured"}
+
+    cache_key = f"greynoise:{ip}"
+    cached = _cache_get(cache_key)
+    if cached:
+        return json.loads(cached)
 
     url = f"https://api.greynoise.io/v3/community/{ip}"
     headers = {"key": GREYNOISE_KEY}
@@ -117,14 +173,8 @@ def check_greynoise(ip: str) -> Dict[str, Any]:
         if response.status_code == 200:
             data = response.json()
             classification = data.get("classification", "unknown")
-
-            score = (
-                80 if classification == "malicious"
-                else 40 if classification == "noise"
-                else 10
-            )
-
-            return {
+            score = 80 if classification == "malicious" else 40 if classification == "noise" else 10
+            result = {
                 "source": "GreyNoise",
                 "score": score,
                 "classification": classification,
@@ -134,6 +184,8 @@ def check_greynoise(ip: str) -> Dict[str, Any]:
                 "last_seen": data.get("last_seen", "Never"),
                 "tags": data.get("tags", [])
             }
+            _cache_set(cache_key, json.dumps(result), ttl=3600)
+            return result
 
         return {"source": "GreyNoise", "error": f"HTTP {response.status_code}"}
 
@@ -141,44 +193,64 @@ def check_greynoise(ip: str) -> Dict[str, Any]:
         return {"source": "GreyNoise", "error": str(e)}
 
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
-def fetch_otx_indicator(indicator: str, indicator_type: str = "IPv4") -> Dict[str, Any]:
-    """Fetch threat intelligence from AlienVault OTX."""
-    if not OTX_KEY:
-        return {"source": "OTX", "error": "Missing API key"}
-
+# ------------------------------
+# AlienVault OTX
+# ------------------------------
+@retry(stop=stop_after_attempt(2), wait=wait_exponential(multiplier=1, min=2, max=10))
+def check_otx(indicator: str, indicator_type: str = "ip") -> Dict[str, Any]:
+    """Check IP or URL against AlienVault OTX (free, API key optional but recommended)"""
     cache_key = f"otx:{indicator_type}:{indicator}"
-    if redis_client:
-        cached = redis_client.get(cache_key)
-        if cached:
-            return json.loads(cached)
+    cached = _cache_get(cache_key)
+    if cached:
+        return json.loads(cached)
 
-    url = f"https://otx.alienvault.com/api/v1/indicators/{indicator_type}/{indicator}/general"
-    headers = {"X-OTX-API-KEY": OTX_KEY}
+    headers = {}
+    if OTX_KEY:
+        headers["X-OTX-API-KEY"] = OTX_KEY
+
+    if indicator_type == "ip":
+        url = f"https://otx.alienvault.com/api/v1/indicators/IPv4/{indicator}/general"
+    elif indicator_type == "url":
+        # OTX expects URL encoded
+        import urllib.parse
+        encoded = urllib.parse.quote(indicator, safe="")
+        url = f"https://otx.alienvault.com/api/v1/indicators/url/{encoded}/general"
+    else:
+        return {"source": "OTX", "error": "Unsupported type"}
+
     try:
         response = requests.get(url, headers=headers, timeout=5)
         if response.status_code == 200:
             data = response.json()
-            reputation = data.get("reputation")
             pulse_count = data.get("pulse_info", {}).get("count", 0)
-            score = 70 if reputation == "malicious" else 30 if pulse_count > 0 else 0
-
+            reputation = data.get("reputation", 0)
+            score = 0
+            if reputation < -3:
+                score = 80
+            elif reputation < 0:
+                score = 50
+            elif pulse_count > 5:
+                score = 30
+            else:
+                score = 10
             result = {
                 "source": "AlienVault OTX",
                 "score": score,
-                "reputation": reputation,
                 "pulse_count": pulse_count,
+                "reputation": reputation,
                 "country": data.get("country_code", ""),
                 "asn": data.get("asn", "")
             }
-            if redis_client:
-                redis_client.setex(cache_key, 300, json.dumps(result))
+            _cache_set(cache_key, json.dumps(result), ttl=3600)
             return result
         return {"source": "OTX", "error": f"HTTP {response.status_code}"}
     except Exception as e:
         return {"source": "OTX", "error": str(e)}
 
 
+# ------------------------------
+# Aggregate IP Intel
+# ------------------------------
 def aggregate_ip_intel(ip: str) -> Dict[str, Any]:
     geo = get_ip_geo(ip)
     results = []
@@ -211,8 +283,8 @@ def aggregate_ip_intel(ip: str) -> Dict[str, Any]:
         if gn.get("score") is not None:
             results.append(gn)
 
-    # OTX enrichment
-    otx = fetch_otx_indicator(ip, "IPv4")
+    # OTX check
+    otx = check_otx(ip, "ip")
     if otx.get("score") is not None:
         results.append(otx)
 
@@ -250,9 +322,17 @@ def aggregate_ip_intel(ip: str) -> Dict[str, Any]:
     }
 
 
+# ------------------------------
+# VirusTotal URL
+# ------------------------------
 def check_virustotal_url(url: str) -> Dict[str, Any]:
     if not VIRUSTOTAL_KEY:
         return {"source": "VirusTotal", "error": "Missing API key"}
+
+    cache_key = f"vt_url:{url}"
+    cached = _cache_get(cache_key)
+    if cached:
+        return json.loads(cached)
 
     url_id = base64.urlsafe_b64encode(url.encode()).decode().strip("=")
     api_url = f"https://www.virustotal.com/api/v3/urls/{url_id}"
@@ -263,14 +343,11 @@ def check_virustotal_url(url: str) -> Dict[str, Any]:
         if response.status_code == 200:
             data = response.json()["data"]["attributes"]
             stats = data.get("last_analysis_stats", {})
-
             malicious = stats.get("malicious", 0)
             suspicious = stats.get("suspicious", 0)
             total = stats.get("total", 1)
-
             score = min(100, int((malicious + suspicious) / total * 100))
-
-            return {
+            result = {
                 "source": "VirusTotal",
                 "score": score,
                 "malicious_votes": malicious,
@@ -279,28 +356,33 @@ def check_virustotal_url(url: str) -> Dict[str, Any]:
                 "url": url,
                 "title": data.get("title", "")
             }
-
+            _cache_set(cache_key, json.dumps(result), ttl=3600)
+            return result
         return {"source": "VirusTotal", "error": f"HTTP {response.status_code}"}
-
     except Exception as e:
         return {"source": "VirusTotal", "error": str(e)}
 
 
+# ------------------------------
+# urlscan.io
+# ------------------------------
 def check_urlscan_io(url: str) -> Dict[str, Any]:
+    cache_key = f"urlscan:{url}"
+    cached = _cache_get(cache_key)
+    if cached:
+        return json.loads(cached)
+
     try:
         search_url = f"https://urlscan.io/api/v1/search/?q={url}"
         resp = requests.get(search_url, timeout=5)
-
         if resp.status_code == 200:
             data = resp.json()
             results = data.get("results", [])
-
             if results:
                 latest = results[0]
                 malicious = latest.get("malicious", False)
                 score = 85 if malicious else 15
-
-                return {
+                result = {
                     "source": "urlscan.io",
                     "score": score,
                     "malicious": malicious,
@@ -308,13 +390,16 @@ def check_urlscan_io(url: str) -> Dict[str, Any]:
                     "screenshot": latest.get("screenshot"),
                     "page_domain": latest.get("page", {}).get("domain")
                 }
-
+                _cache_set(cache_key, json.dumps(result), ttl=3600)
+                return result
         return {"source": "urlscan.io", "error": "No results or error"}
-
     except Exception as e:
         return {"source": "urlscan.io", "error": str(e)}
 
 
+# ------------------------------
+# Aggregate URL Intel
+# ------------------------------
 def aggregate_url_intel(url: str) -> Dict[str, Any]:
     if not url.startswith(("http://", "https://")):
         url = "http://" + url
@@ -328,6 +413,11 @@ def aggregate_url_intel(url: str) -> Dict[str, Any]:
     us = check_urlscan_io(url)
     if us.get("score") is not None:
         results.append(us)
+
+    # OTX URL check
+    otx = check_otx(url, "url")
+    if otx.get("score") is not None:
+        results.append(otx)
 
     scores = [r["score"] for r in results if "score" in r and not r.get("error")]
     avg_score = sum(scores) // len(scores) if scores else 0
