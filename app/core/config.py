@@ -1,3 +1,4 @@
+import os
 from pydantic_settings import BaseSettings
 
 class Settings(BaseSettings):
@@ -11,6 +12,11 @@ class Settings(BaseSettings):
     VIRUSTOTAL_API_KEY: str = ""
     ABUSEIPDB_API_KEY: str = ""
     GREYNOISE_API_KEY: str = ""
+
+    # הוספת שדות עבור Threat Intelligence ו-Redis
+    OTX_API_KEY: str = ""
+    REDIS_HOST: str = "localhost"
+    REDIS_PORT: int = 6379
 
     class Config:
         env_file = ".env"
