@@ -23,5 +23,5 @@ passlib[bcrypt]
 email-validator
 pydantic[email]
 requests
-tenacity==8.2.3
-redis==5.0.1
+tenacity
+redis
