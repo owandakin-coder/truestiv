@@ -1,0 +1,10 @@
+.env
+.env.*
+frontend/
+node_modules/
+__pycache__/
+*.pyc
+.cache/
+.pytest_cache/
+.publish_manifest_backend.json
+.publish_manifest_frontend.json
