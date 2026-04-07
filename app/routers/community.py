@@ -9,6 +9,13 @@ from app.schemas.schemas import ThreatPublishRequest
 
 router = APIRouter()
 
+
+def normalize_indicator(threat_type: str, indicator: str) -> str:
+    normalized = (indicator or "").strip()
+    if threat_type in {"url", "ip", "hash", "email", "domain", "phone"}:
+        return normalized.lower()
+    return normalized
+
 @router.get("/feed")
 def get_threat_feed(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     reports = db.query(ThreatReport).order_by(ThreatReport.created_at.desc()).limit(50).all()
@@ -95,11 +102,42 @@ def publish_threat(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
+    normalized_type = (data.threat_type or "").strip().lower()
+    normalized_indicator = normalize_indicator(normalized_type, data.indicator)
+    if not normalized_indicator:
+        raise HTTPException(status_code=400, detail="Indicator is required")
+
+    existing_threats = (
+        db.query(CommunityThreat)
+        .filter(CommunityThreat.threat_type == normalized_type)
+        .all()
+    )
+    existing = next(
+        (
+            threat
+            for threat in existing_threats
+            if normalize_indicator(threat.threat_type, threat.indicator) == normalized_indicator
+        ),
+        None,
+    )
+
+    if existing:
+        return {
+            "success": True,
+            "duplicate": True,
+            "id": existing.id,
+            "threat_type": existing.threat_type,
+            "indicator": existing.indicator,
+            "risk_score": existing.risk_score,
+            "threat_level": existing.threat_level,
+            "published_at": existing.published_at.isoformat() if existing.published_at else None,
+        }
+
     threat = CommunityThreat(
-        threat_type=data.threat_type,
-        indicator=data.indicator,
+        threat_type=normalized_type,
+        indicator=normalized_indicator,
         risk_score=data.risk_score,
-        threat_level=data.threat_level,
+        threat_level=(data.threat_level or "suspicious").lower(),
         source_analysis_id=data.analysis_id,
         published_by=current_user.id,
         raw_intel=[]
@@ -111,6 +149,7 @@ def publish_threat(
 
     return {
         "success": True,
+        "duplicate": False,
         "id": threat.id,
         "threat_type": threat.threat_type,
         "indicator": threat.indicator,
