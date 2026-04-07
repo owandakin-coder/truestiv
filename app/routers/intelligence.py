@@ -23,10 +23,10 @@ def _extract_ip_candidates(db: Session, limit: int = 200) -> List[str]:
     threat_ips = [
         row[0]
         for row in db.query(CommunityThreat.indicator)
-        .filter(CommunityThreat.threat_type == "ip")
         .order_by(CommunityThreat.published_at.desc())
-        .limit(limit)
+        .limit(limit * 3)
         .all()
+        if row[0] and IP_PATTERN.match(str(row[0]).strip())
     ]
     sender_ips = [
         row[0]

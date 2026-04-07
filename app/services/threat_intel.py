@@ -2,6 +2,7 @@ import requests
 import base64
 import json
 import logging
+import os
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, List
 from tenacity import retry, stop_after_attempt, wait_exponential
@@ -17,7 +18,11 @@ except ImportError:
     REDIS_AVAILABLE = False
     redis = None
 
-VIRUSTOTAL_KEY = settings.VIRUSTOTAL_API_KEY
+VIRUSTOTAL_KEY = (
+    getattr(settings, "VIRUSTOTAL_API_KEY", "")
+    or os.getenv("VIRUSTOTAL_API_KEY", "")
+    or os.getenv("VIRUSTOTAL_KEY", "")
+)
 ABUSEIPDB_KEY = settings.ABUSEIPDB_API_KEY
 GREYNOISE_KEY = settings.GREYNOISE_API_KEY
 OTX_KEY = getattr(settings, "OTX_API_KEY", "")
@@ -53,11 +58,29 @@ def _cache_set(key: str, value: str, ttl: int = 300):
 # IP Geolocation
 # ------------------------------
 def get_ip_geo(ip: str) -> Dict[str, Any]:
-    try:
-        response = requests.get(f"http://ip-api.com/json/{ip}", timeout=3)
-        if response.status_code == 200:
+    providers = [
+        ("https://ipapi.co/{ip}/json/", "ipapi"),
+        ("http://ip-api.com/json/{ip}", "ip-api"),
+    ]
+    for template, provider_name in providers:
+        try:
+            response = requests.get(template.format(ip=ip), timeout=4)
+            if response.status_code != 200:
+                continue
             data = response.json()
-            if data.get("status") == "success":
+            if provider_name == "ipapi" and not data.get("error"):
+                return {
+                    "country": data.get("country_name", "Unknown"),
+                    "country_code": data.get("country_code", ""),
+                    "region": data.get("region", ""),
+                    "city": data.get("city", ""),
+                    "isp": data.get("org", ""),
+                    "org": data.get("org", ""),
+                    "as": data.get("asn", ""),
+                    "lat": data.get("latitude"),
+                    "lon": data.get("longitude"),
+                }
+            if provider_name == "ip-api" and data.get("status") == "success":
                 return {
                     "country": data.get("country", "Unknown"),
                     "country_code": data.get("countryCode", ""),
@@ -69,8 +92,8 @@ def get_ip_geo(ip: str) -> Dict[str, Any]:
                     "lat": data.get("lat"),
                     "lon": data.get("lon")
                 }
-    except Exception:
-        pass
+        except Exception as exc:
+            logger.debug("IP geolocation provider %s failed for %s: %s", provider_name, ip, exc)
     return {"country": "Unknown", "isp": "Unknown", "org": "Unknown", "as": "Unknown"}
 
 

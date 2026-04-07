@@ -10,9 +10,18 @@ import re
 import hashlib
 import ipaddress
 import secrets
+import os
 import requests
 
 router = APIRouter()
+
+
+def get_virustotal_api_key() -> str:
+    return (
+        getattr(settings, "VIRUSTOTAL_API_KEY", "")
+        or os.getenv("VIRUSTOTAL_API_KEY", "")
+        or os.getenv("VIRUSTOTAL_KEY", "")
+    )
 
 SUSPICIOUS_PATTERNS = [
     r'bit\.ly', r'tinyurl', r'goo\.gl', r't\.co',
@@ -335,7 +344,12 @@ def analyze_url_enhanced(data: dict, db: Session = Depends(get_db), current_user
 # Hash scan using VirusTotal
 def check_virustotal_hash(file_hash: str, api_key: str) -> dict:
     if not api_key:
-        return {"error": True, "positives": 0, "total": 0}
+        return {
+            "error": True,
+            "positives": 0,
+            "total": 0,
+            "detail": "VirusTotal API key is missing. Render should expose VIRUSTOTAL_API_KEY or VIRUSTOTAL_KEY.",
+        }
     url = f"https://www.virustotal.com/api/v3/files/{file_hash}"
     headers = {"x-apikey": api_key}
     try:
@@ -351,9 +365,42 @@ def check_virustotal_hash(file_hash: str, api_key: str) -> dict:
                 "scan_date": data.get("data", {}).get("attributes", {}).get("last_analysis_date"),
                 "permalink": f"https://www.virustotal.com/gui/file/{file_hash}"
             }
-        return {"error": True, "positives": 0, "total": 0}
-    except Exception:
-        return {"error": True, "positives": 0, "total": 0}
+        if resp.status_code == 404:
+            return {
+                "error": False,
+                "not_found": True,
+                "positives": 0,
+                "total": 0,
+                "permalink": f"https://www.virustotal.com/gui/file/{file_hash}",
+                "detail": "VirusTotal does not have a report for this hash yet.",
+            }
+        if resp.status_code in {401, 403}:
+            return {
+                "error": True,
+                "positives": 0,
+                "total": 0,
+                "detail": "VirusTotal rejected the API key. Check the Render environment variable value.",
+            }
+        if resp.status_code == 429:
+            return {
+                "error": True,
+                "positives": 0,
+                "total": 0,
+                "detail": "VirusTotal rate limit exceeded. Try again later or upgrade the API quota.",
+            }
+        return {
+            "error": True,
+            "positives": 0,
+            "total": 0,
+            "detail": f"VirusTotal returned HTTP {resp.status_code}.",
+        }
+    except requests.RequestException as exc:
+        return {
+            "error": True,
+            "positives": 0,
+            "total": 0,
+            "detail": f"VirusTotal request failed: {exc}",
+        }
 
 @router.post("/hash")
 def scan_hash(data: dict, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
@@ -363,9 +410,9 @@ def scan_hash(data: dict, db: Session = Depends(get_db), current_user: User = De
     if len(file_hash) not in [32, 40, 64] or not all(c in "0123456789abcdef" for c in file_hash):
         raise HTTPException(status_code=400, detail="Invalid hash format (must be MD5, SHA1 or SHA256)")
     
-    result = check_virustotal_hash(file_hash, settings.VIRUSTOTAL_API_KEY)
+    result = check_virustotal_hash(file_hash, get_virustotal_api_key())
     if result.get("error"):
-        raise HTTPException(status_code=500, detail="VirusTotal check failed or API key missing")
+        raise HTTPException(status_code=500, detail=result.get("detail") or "VirusTotal check failed")
     
     positives = result["positives"]
     total = result["total"]
@@ -381,18 +428,22 @@ def scan_hash(data: dict, db: Session = Depends(get_db), current_user: User = De
         threat_level = "safe"
         recommendation = "allow"
     
-    summary = f"VirusTotal detected {positives}/{total} engines as malicious"
+    if result.get("not_found"):
+        summary = "VirusTotal does not have a report for this hash yet."
+    else:
+        summary = f"VirusTotal detected {positives}/{total} engines as malicious"
     
     return {
         "success": True,
         "hash": file_hash,
         "threat_level": threat_level,
         "risk_score": risk_score,
-        "confidence": min(95, risk_score + 15) if risk_score > 0 else 80,
+        "confidence": 65 if result.get("not_found") else (min(95, risk_score + 15) if risk_score > 0 else 80),
         "positives": positives,
         "total": total,
         "permalink": result.get("permalink"),
         "indicators": [summary] if positives > 0 else ["No known detections"],
         "recommendation": recommendation,
-        "summary": summary
+        "summary": summary,
+        "not_found": bool(result.get("not_found")),
     }
