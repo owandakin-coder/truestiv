@@ -1,3 +1,4 @@
+import secrets
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 from app.core.database import get_db
@@ -43,6 +44,24 @@ def login(login_data: LoginRequest, db: Session = Depends(get_db)):
 
     access_token = create_access_token(data={"sub": user.email})
 
+    return {"access_token": access_token, "token_type": "bearer"}
+
+
+@router.post("/guest", response_model=Token)
+def guest_access(db: Session = Depends(get_db)):
+    guest_id = secrets.token_hex(6)
+    guest_user = User(
+        email=f"guest+{guest_id}@trustive.ai",
+        username=f"guest_{guest_id}",
+        hashed_password=hash_password(secrets.token_urlsafe(24)),
+        is_active=True,
+    )
+
+    db.add(guest_user)
+    db.commit()
+    db.refresh(guest_user)
+
+    access_token = create_access_token(data={"sub": guest_user.email})
     return {"access_token": access_token, "token_type": "bearer"}
 
 
