@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 from app.core.auth import get_current_user
 from app.core.config import settings
 from app.core.database import get_db
-from app.models.models import CommunityThreat, EmailAnalysis, User
+from app.models.models import CommunityThreat, EmailAnalysis, IPScanObservation, User
 from app.services.threat_intel import (
     collect_all_intel,
     get_ip_geo,
@@ -52,10 +52,46 @@ def geo_map(
     current_user: User = Depends(get_current_user),
 ):
     markers = []
+    seen = set()
+
+    recent_observations = (
+        db.query(IPScanObservation)
+        .order_by(IPScanObservation.created_at.desc())
+        .limit(120)
+        .all()
+    )
+
+    for observation in recent_observations:
+        if not observation.ip or observation.ip in seen:
+            continue
+        if observation.latitude is None or observation.longitude is None:
+            continue
+        seen.add(observation.ip)
+        markers.append(
+            {
+                "indicator": observation.ip,
+                "latitude": observation.latitude,
+                "longitude": observation.longitude,
+                "country": observation.country or "Unknown",
+                "city": observation.city or "",
+                "region": observation.region or "",
+                "organization": observation.organization or "",
+                "isp": observation.isp or "",
+                "risk_score": observation.risk_score or 0,
+                "threat_level": observation.threat_level or "suspicious",
+                "published_at": observation.created_at.isoformat() if observation.created_at else datetime.utcnow().isoformat(),
+                "location_name": ", ".join(part for part in [observation.city, observation.country] if part) or "Unknown location",
+                "source": observation.source or "scanner",
+            }
+        )
+
     for ip in _extract_ip_candidates(db):
+        if ip in seen:
+            continue
         geo = get_ip_geo(ip)
         if geo.get("lat") is None or geo.get("lon") is None:
             continue
+        seen.add(ip)
         matching_threat = (
             db.query(CommunityThreat)
             .filter(CommunityThreat.indicator == ip)
@@ -78,6 +114,8 @@ def geo_map(
                     if matching_threat and matching_threat.published_at
                     else datetime.utcnow().isoformat()
                 ),
+                "location_name": ", ".join(part for part in [geo.get("city"), geo.get("country")] if part) or "Unknown location",
+                "source": "community" if matching_threat else "analysis",
             }
         )
 

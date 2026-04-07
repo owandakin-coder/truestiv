@@ -335,3 +335,24 @@ class MediaAnalysis(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     user = relationship("User")
+
+
+class IPScanObservation(Base):
+    __tablename__ = "ip_scan_observations"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    ip = Column(String(64), nullable=False, index=True)
+    threat_level = Column(String(20), nullable=False, default="safe")
+    risk_score = Column(Integer, default=0)
+    country = Column(String(120))
+    city = Column(String(120))
+    region = Column(String(120))
+    isp = Column(String(255))
+    organization = Column(String(255))
+    latitude = Column(Float)
+    longitude = Column(Float)
+    source = Column(String(120), default="scanner")
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    user = relationship("User")

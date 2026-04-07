@@ -3,7 +3,7 @@ from sqlalchemy.orm import Session
 from app.core.database import get_db
 from app.core.auth import get_current_user
 from app.core.ai_engine import analyze_threat
-from app.models.models import User
+from app.models.models import IPScanObservation, User
 from app.services.threat_intel import aggregate_ip_intel
 from app.core.config import settings
 import re
@@ -21,6 +21,45 @@ def get_virustotal_api_key() -> str:
         getattr(settings, "VIRUSTOTAL_API_KEY", "")
         or os.getenv("VIRUSTOTAL_API_KEY", "")
         or os.getenv("VIRUSTOTAL_KEY", "")
+    )
+
+
+def record_ip_scan_observation(db: Session, user_id: int, ip: str, result: dict, source: str = "scanner") -> None:
+    geo = result.get("geo") or {}
+    latitude = geo.get("latitude") if geo.get("latitude") is not None else geo.get("lat")
+    longitude = geo.get("longitude") if geo.get("longitude") is not None else geo.get("lon")
+
+    existing = (
+        db.query(IPScanObservation)
+        .filter(IPScanObservation.user_id == user_id, IPScanObservation.ip == ip)
+        .order_by(IPScanObservation.created_at.desc())
+        .first()
+    )
+
+    payload = {
+        "threat_level": str(result.get("threat_level") or "safe").lower(),
+        "risk_score": int(result.get("aggregated_score") or result.get("risk_score") or 0),
+        "country": geo.get("country"),
+        "city": geo.get("city"),
+        "region": geo.get("region"),
+        "isp": geo.get("isp"),
+        "organization": geo.get("organization") or geo.get("org"),
+        "latitude": latitude,
+        "longitude": longitude,
+        "source": source,
+    }
+
+    if existing:
+        for key, value in payload.items():
+            setattr(existing, key, value)
+        return
+
+    db.add(
+        IPScanObservation(
+            user_id=user_id,
+            ip=ip,
+            **payload,
+        )
     )
 
 SUSPICIOUS_PATTERNS = [
@@ -315,6 +354,12 @@ def check_ip_enhanced(data: dict, db: Session = Depends(get_db), current_user: U
     if not ip:
         raise HTTPException(status_code=400, detail="IP address is required")
     result = aggregate_ip_intel(ip)
+    try:
+        if result.get("success"):
+            record_ip_scan_observation(db, current_user.id, ip, result, source="scanner_enhanced")
+            db.commit()
+    except Exception:
+        db.rollback()
     return result
 
 
