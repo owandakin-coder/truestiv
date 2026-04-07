@@ -3,7 +3,7 @@ from sqlalchemy.orm import Session
 from app.core.database import get_db
 from app.core.auth import get_current_user
 from app.core.ai_engine import analyze_threat
-from app.models.models import IPScanObservation, User
+from app.models.models import IPScanObservation, ScanHistory, User
 from app.services.threat_intel import aggregate_ip_intel
 from app.core.config import settings
 import re
@@ -21,6 +21,42 @@ def get_virustotal_api_key() -> str:
         getattr(settings, "VIRUSTOTAL_API_KEY", "")
         or os.getenv("VIRUSTOTAL_API_KEY", "")
         or os.getenv("VIRUSTOTAL_KEY", "")
+    )
+
+
+def normalize_indicator(scan_type: str, indicator: str) -> str:
+    value = (indicator or "").strip()
+    if scan_type in {"url", "ip", "hash", "domain", "email", "phone"}:
+        return value.lower()
+    return value
+
+
+def persist_scan_history(
+    db: Session,
+    user_id: int,
+    scan_type: str,
+    indicator: str,
+    result: dict,
+    source: str = "scanner",
+) -> None:
+    if not indicator:
+        return
+
+    geo = result.get("geo") or {}
+    db.add(
+        ScanHistory(
+            user_id=user_id,
+            scan_type=scan_type,
+            indicator=indicator,
+            normalized_indicator=normalize_indicator(scan_type, indicator),
+            threat_level=str(result.get("threat_level") or "safe").lower(),
+            risk_score=int(result.get("aggregated_score") or result.get("risk_score") or 0),
+            confidence=float(result.get("confidence") or 0),
+            country=geo.get("country"),
+            source=source,
+            summary=result.get("summary") or "",
+            result=result,
+        )
     )
 
 
@@ -140,7 +176,7 @@ def analyze_url(data: dict, db: Session = Depends(get_db), current_user: User = 
         recommendation = "allow"
         summary = "No significant threat indicators found."
 
-    return {
+    response = {
         "success": True,
         "url": url,
         "threat_level": threat_level,
@@ -150,6 +186,12 @@ def analyze_url(data: dict, db: Session = Depends(get_db), current_user: User = 
         "recommendation": recommendation,
         "summary": summary
     }
+    try:
+        persist_scan_history(db, current_user.id, "url", url, response, source="scanner_url")
+        db.commit()
+    except Exception:
+        db.rollback()
+    return response
 
 
 KNOWN_BAD_IPS = [
@@ -172,7 +214,7 @@ def check_ip(data: dict, db: Session = Depends(get_db), current_user: User = Dep
     risk_score = 0
 
     if ip_obj.is_private:
-        return {
+        response = {
             "success": True,
             "ip": ip,
             "threat_level": "safe",
@@ -184,9 +226,15 @@ def check_ip(data: dict, db: Session = Depends(get_db), current_user: User = Dep
             "summary": "Private IP address.",
             "geo": {"country": "Internal", "isp": "Private Network"}
         }
+        try:
+            persist_scan_history(db, current_user.id, "ip", ip, response, source="scanner_ip")
+            db.commit()
+        except Exception:
+            db.rollback()
+        return response
 
     if ip_obj.is_loopback:
-        return {
+        response = {
             "success": True,
             "ip": ip,
             "threat_level": "safe",
@@ -198,6 +246,12 @@ def check_ip(data: dict, db: Session = Depends(get_db), current_user: User = Dep
             "summary": "Loopback address.",
             "geo": {}
         }
+        try:
+            persist_scan_history(db, current_user.id, "ip", ip, response, source="scanner_ip")
+            db.commit()
+        except Exception:
+            db.rollback()
+        return response
 
     for bad_prefix in KNOWN_BAD_IPS:
         if ip.startswith(bad_prefix):
@@ -226,7 +280,7 @@ def check_ip(data: dict, db: Session = Depends(get_db), current_user: User = Dep
         threat_level, recommendation = "safe", "allow"
         summary = "No significant threats associated with this IP."
 
-    return {
+    response = {
         "success": True,
         "ip": ip,
         "threat_level": threat_level,
@@ -242,6 +296,12 @@ def check_ip(data: dict, db: Session = Depends(get_db), current_user: User = Dep
             "asn": f"AS{hash(ip) % 65000}"
         }
     }
+    try:
+        persist_scan_history(db, current_user.id, "ip", ip, response, source="scanner_ip")
+        db.commit()
+    except Exception:
+        db.rollback()
+    return response
 
 
 DANGEROUS_EXTENSIONS = [
@@ -312,7 +372,7 @@ def scan_file(data: dict, db: Session = Depends(get_db), current_user: User = De
         threat_level, recommendation = "safe", "allow"
         summary = "No significant threats detected."
 
-    return {
+    response = {
         "success": True,
         "filename": filename,
         "extension": ext,
@@ -323,6 +383,12 @@ def scan_file(data: dict, db: Session = Depends(get_db), current_user: User = De
         "recommendation": recommendation,
         "summary": summary
     }
+    try:
+        persist_scan_history(db, current_user.id, "file", filename, response, source="scanner_file")
+        db.commit()
+    except Exception:
+        db.rollback()
+    return response
 
 
 @router.get("/apikeys")
@@ -357,6 +423,7 @@ def check_ip_enhanced(data: dict, db: Session = Depends(get_db), current_user: U
     try:
         if result.get("success"):
             record_ip_scan_observation(db, current_user.id, ip, result, source="scanner_enhanced")
+            persist_scan_history(db, current_user.id, "ip", ip, result, source="scanner_enhanced")
             db.commit()
     except Exception:
         db.rollback()
@@ -383,7 +450,13 @@ def analyze_url_enhanced(data: dict, db: Session = Depends(get_db), current_user
     if not result["success"]:
         raise HTTPException(status_code=500, detail="Enhanced URL analysis failed")
 
-    return result["analysis"]
+    analysis = result["analysis"]
+    try:
+        persist_scan_history(db, current_user.id, "url", url, analysis, source="scanner_url_enhanced")
+        db.commit()
+    except Exception:
+        db.rollback()
+    return analysis
 
 
 # Hash scan using VirusTotal
@@ -478,7 +551,7 @@ def scan_hash(data: dict, db: Session = Depends(get_db), current_user: User = De
     else:
         summary = f"VirusTotal detected {positives}/{total} engines as malicious"
     
-    return {
+    response = {
         "success": True,
         "hash": file_hash,
         "threat_level": threat_level,
@@ -492,3 +565,9 @@ def scan_hash(data: dict, db: Session = Depends(get_db), current_user: User = De
         "summary": summary,
         "not_found": bool(result.get("not_found")),
     }
+    try:
+        persist_scan_history(db, current_user.id, "hash", file_hash, response, source="scanner_hash")
+        db.commit()
+    except Exception:
+        db.rollback()
+    return response

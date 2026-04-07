@@ -1,63 +1,88 @@
 import re
-from datetime import datetime
-from typing import Any, Dict, List
+from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
 
 from app.core.auth import get_current_user
 from app.core.config import settings
 from app.core.database import get_db
-from app.models.models import CommunityThreat, EmailAnalysis, IPScanObservation, User
-from app.services.threat_intel import (
-    collect_all_intel,
-    get_ip_geo,
+from app.models.models import (
+    CommunityThreat,
+    EmailAnalysis,
+    IPScanObservation,
+    MediaAnalysis,
+    ScanHistory,
+    User,
 )
+from app.services.threat_intel import collect_all_intel, get_ip_geo
 
 router = APIRouter()
 IP_PATTERN = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
 
 
-def _extract_ip_candidates(db: Session, limit: int = 200) -> List[str]:
-    threat_ips = [
-        row[0]
-        for row in db.query(CommunityThreat.indicator)
-        .order_by(CommunityThreat.published_at.desc())
-        .limit(limit * 3)
-        .all()
-        if row[0] and IP_PATTERN.match(str(row[0]).strip())
-    ]
-    sender_ips = [
-        row[0]
-        for row in db.query(EmailAnalysis.sender)
-        .filter(EmailAnalysis.sender.isnot(None))
-        .order_by(EmailAnalysis.created_at.desc())
-        .limit(limit)
-        .all()
-        if row[0] and IP_PATTERN.match(row[0])
-    ]
-    ordered = []
-    seen = set()
-    for ip in threat_ips + sender_ips:
-        if ip and ip not in seen:
-            ordered.append(ip)
-            seen.add(ip)
-    return ordered
+def _normalize_level(value: str | None) -> str:
+    normalized = (value or "").strip().lower()
+    if normalized == "dangerous":
+        return "threat"
+    return normalized or "unknown"
 
 
-@router.get("/geo-map")
-def geo_map(
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
+def _normalize_indicator(ioc_type: str, indicator: str) -> str:
+    value = (indicator or "").strip()
+    if ioc_type in {"url", "ip", "hash", "domain", "email", "phone"}:
+        return value.lower()
+    return value
+
+
+def _iso(value) -> str | None:
+    if not value:
+        return None
+    if isinstance(value, str):
+        return value
+    return value.isoformat()
+
+
+def _parse_time_range(value: str | None) -> datetime | None:
+    normalized = (value or "30d").strip().lower()
+    if normalized in {"", "all", "any"}:
+        return None
+    now = datetime.now(timezone.utc)
+    mapping = {
+        "24h": timedelta(hours=24),
+        "48h": timedelta(hours=48),
+        "7d": timedelta(days=7),
+        "14d": timedelta(days=14),
+        "30d": timedelta(days=30),
+        "90d": timedelta(days=90),
+    }
+    delta = mapping.get(normalized)
+    return now - delta if delta else now - timedelta(days=30)
+
+
+def _in_range(value, cutoff: datetime | None) -> bool:
+    if not cutoff:
+        return True
+    if not value:
+        return False
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value >= cutoff
+
+
+def _build_ioc_href(ioc_type: str, indicator: str) -> str:
+    return f"/ioc/{ioc_type}/{quote(indicator, safe='')}"
+
+
+def _collect_geo_markers(db: Session) -> list[dict]:
     markers = []
     seen = set()
 
     recent_observations = (
         db.query(IPScanObservation)
         .order_by(IPScanObservation.created_at.desc())
-        .limit(120)
+        .limit(180)
         .all()
     )
 
@@ -70,6 +95,7 @@ def geo_map(
         markers.append(
             {
                 "indicator": observation.ip,
+                "ioc_type": "ip",
                 "latitude": observation.latitude,
                 "longitude": observation.longitude,
                 "country": observation.country or "Unknown",
@@ -78,51 +104,477 @@ def geo_map(
                 "organization": observation.organization or "",
                 "isp": observation.isp or "",
                 "risk_score": observation.risk_score or 0,
-                "threat_level": observation.threat_level or "suspicious",
-                "published_at": observation.created_at.isoformat() if observation.created_at else datetime.utcnow().isoformat(),
+                "threat_level": _normalize_level(observation.threat_level),
+                "published_at": _iso(observation.created_at) or datetime.utcnow().isoformat(),
                 "location_name": ", ".join(part for part in [observation.city, observation.country] if part) or "Unknown location",
                 "source": observation.source or "scanner",
+                "details_path": _build_ioc_href("ip", observation.ip),
             }
         )
 
-    for ip in _extract_ip_candidates(db):
-        if ip in seen:
+    threat_ips = (
+        db.query(CommunityThreat)
+        .order_by(CommunityThreat.published_at.desc())
+        .limit(180)
+        .all()
+    )
+
+    for threat in threat_ips:
+        ip = (threat.indicator or "").strip()
+        if not ip or ip in seen or not IP_PATTERN.match(ip):
             continue
         geo = get_ip_geo(ip)
         if geo.get("lat") is None or geo.get("lon") is None:
             continue
         seen.add(ip)
-        matching_threat = (
-            db.query(CommunityThreat)
-            .filter(CommunityThreat.indicator == ip)
-            .order_by(CommunityThreat.published_at.desc())
-            .first()
-        )
+        intel_source = None
+        if isinstance(threat.raw_intel, dict):
+            intel_source = threat.raw_intel.get("source")
         markers.append(
             {
                 "indicator": ip,
+                "ioc_type": "ip",
                 "latitude": geo.get("lat"),
                 "longitude": geo.get("lon"),
-                "country": geo.get("country"),
-                "city": geo.get("city"),
-                "organization": geo.get("org"),
-                "isp": geo.get("isp"),
-                "risk_score": matching_threat.risk_score if matching_threat else 25,
-                "threat_level": matching_threat.threat_level if matching_threat else "suspicious",
-                "published_at": (
-                    matching_threat.published_at.isoformat()
-                    if matching_threat and matching_threat.published_at
-                    else datetime.utcnow().isoformat()
-                ),
+                "country": geo.get("country") or "Unknown",
+                "city": geo.get("city") or "",
+                "region": geo.get("region") or "",
+                "organization": geo.get("org") or "",
+                "isp": geo.get("isp") or "",
+                "risk_score": threat.risk_score or 25,
+                "threat_level": _normalize_level(threat.threat_level),
+                "published_at": _iso(threat.published_at) or datetime.utcnow().isoformat(),
                 "location_name": ", ".join(part for part in [geo.get("city"), geo.get("country")] if part) or "Unknown location",
-                "source": "community" if matching_threat else "analysis",
+                "source": intel_source or "community",
+                "details_path": _build_ioc_href("ip", ip),
             }
         )
 
+    return markers
+
+
+def _build_scan_item(item: ScanHistory) -> dict:
+    return {
+        "id": item.id,
+        "scan_type": item.scan_type,
+        "indicator": item.indicator,
+        "threat_level": _normalize_level(item.threat_level),
+        "risk_score": item.risk_score or 0,
+        "confidence": item.confidence or 0,
+        "country": item.country,
+        "source": item.source or "scanner",
+        "summary": item.summary or "",
+        "created_at": _iso(item.created_at),
+        "details_path": _build_ioc_href(item.scan_type, item.indicator),
+    }
+
+
+def _build_scan_event(item: ScanHistory) -> dict:
+    return {
+        "id": f"scan-{item.id}",
+        "event_type": "scan",
+        "source": item.source or "scanner",
+        "ioc_type": item.scan_type,
+        "indicator": item.indicator,
+        "title": f"{item.scan_type.upper()} scan recorded",
+        "summary": item.summary or "A new scanner result was recorded.",
+        "threat_level": _normalize_level(item.threat_level),
+        "risk_score": item.risk_score or 0,
+        "country": item.country,
+        "created_at": _iso(item.created_at),
+        "details_path": _build_ioc_href(item.scan_type, item.indicator),
+    }
+
+
+def _build_community_event(item: CommunityThreat) -> dict:
+    return {
+        "id": f"community-{item.id}",
+        "event_type": "community",
+        "source": "community",
+        "ioc_type": item.threat_type,
+        "indicator": item.indicator,
+        "title": item.title or f"{str(item.threat_type or 'indicator').upper()} promoted to community",
+        "summary": item.description or "A community-visible threat indicator was published.",
+        "threat_level": _normalize_level(item.threat_level),
+        "risk_score": item.risk_score or 0,
+        "created_at": _iso(item.published_at),
+        "details_path": _build_ioc_href(item.threat_type, item.indicator),
+    }
+
+
+def _build_analysis_event(item: EmailAnalysis) -> dict:
+    indicator = item.sender or item.phone_number or item.subject or f"{item.channel} analysis"
+    ioc_type = "email" if item.channel == "email" else "phone"
+    confidence = float(item.confidence or 0)
+    risk_score = max(0, min(100, int(confidence * 100) if confidence <= 1 else int(confidence)))
+    return {
+        "id": f"analysis-{item.id}",
+        "event_type": "analysis",
+        "source": "analysis",
+        "ioc_type": ioc_type,
+        "indicator": indicator,
+        "title": item.subject or f"{str(item.channel or 'message').upper()} analysis",
+        "summary": item.summary or "A message was analyzed by Trustive AI.",
+        "threat_level": _normalize_level(item.threat_level),
+        "risk_score": risk_score,
+        "created_at": _iso(item.created_at),
+    }
+
+
+def _build_media_event(item: MediaAnalysis) -> dict:
+    return {
+        "id": f"media-{item.id}",
+        "event_type": "media",
+        "source": "media",
+        "ioc_type": item.media_type or "media",
+        "indicator": item.filename or f"media-{item.id}",
+        "title": f"{str(item.media_type or 'media').title()} analysis",
+        "summary": item.summary or "A media artifact was analyzed.",
+        "threat_level": _normalize_level(item.threat_level),
+        "risk_score": item.risk_score or 0,
+        "created_at": _iso(item.created_at),
+    }
+
+
+@router.get("/geo-map")
+def geo_map(
+    source: str | None = None,
+    country: str | None = None,
+    threat_level: str | None = None,
+    time_range: str = "30d",
+    limit: int = Query(default=200, ge=1, le=500),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    cutoff = _parse_time_range(time_range)
+    all_markers = _collect_geo_markers(db)
+
+    available_sources = sorted({marker["source"] for marker in all_markers if marker.get("source")})
+    available_countries = sorted({marker["country"] for marker in all_markers if marker.get("country") and marker.get("country") != "Unknown"})
+    available_levels = sorted({marker["threat_level"] for marker in all_markers if marker.get("threat_level") and marker.get("threat_level") != "unknown"})
+
+    normalized_source = (source or "").strip().lower()
+    normalized_country = (country or "").strip().lower()
+    normalized_level = _normalize_level(threat_level)
+
+    markers = []
+    for marker in all_markers:
+        published_at = datetime.fromisoformat(marker["published_at"]) if marker.get("published_at") else None
+        if normalized_source and normalized_source not in {"all", marker.get("source", "").lower()}:
+            continue
+        if normalized_country and marker.get("country", "").lower() != normalized_country:
+            continue
+        if normalized_level not in {"", "all", "unknown"} and marker.get("threat_level") != normalized_level:
+            continue
+        if not _in_range(published_at, cutoff):
+            continue
+        markers.append(marker)
+
+    markers = markers[:limit]
     return {
         "success": True,
         "count": len(markers),
         "markers": markers,
+        "filters": {
+            "source": source or "all",
+            "country": country or "all",
+            "threat_level": threat_level or "all",
+            "time_range": time_range,
+        },
+        "facets": {
+            "sources": available_sources,
+            "countries": available_countries,
+            "threat_levels": available_levels,
+        },
+    }
+
+
+@router.get("/scan-history")
+def scan_history(
+    scan_type: str | None = None,
+    threat_level: str | None = None,
+    time_range: str = "30d",
+    limit: int = Query(default=40, ge=1, le=200),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    cutoff = _parse_time_range(time_range)
+    query = (
+        db.query(ScanHistory)
+        .filter(ScanHistory.user_id == current_user.id)
+        .order_by(ScanHistory.created_at.desc())
+    )
+    if scan_type and scan_type.lower() != "all":
+        query = query.filter(ScanHistory.scan_type == scan_type.lower())
+    items = query.limit(limit * 4).all()
+
+    normalized_level = _normalize_level(threat_level)
+    filtered = []
+    for item in items:
+        if normalized_level not in {"", "all", "unknown"} and _normalize_level(item.threat_level) != normalized_level:
+            continue
+        if not _in_range(item.created_at, cutoff):
+            continue
+        filtered.append(_build_scan_item(item))
+        if len(filtered) >= limit:
+            break
+
+    return {
+        "success": True,
+        "items": filtered,
+    }
+
+
+@router.get("/timeline")
+def timeline(
+    source: str | None = None,
+    threat_level: str | None = None,
+    time_range: str = "30d",
+    limit: int = Query(default=60, ge=1, le=200),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    cutoff = _parse_time_range(time_range)
+    normalized_source = (source or "").strip().lower()
+    normalized_level = _normalize_level(threat_level)
+
+    events = []
+
+    for item in (
+        db.query(ScanHistory)
+        .filter(ScanHistory.user_id == current_user.id)
+        .order_by(ScanHistory.created_at.desc())
+        .limit(limit)
+        .all()
+    ):
+        events.append(_build_scan_event(item))
+
+    for item in db.query(CommunityThreat).order_by(CommunityThreat.published_at.desc()).limit(limit).all():
+        events.append(_build_community_event(item))
+
+    for item in (
+        db.query(EmailAnalysis)
+        .filter(EmailAnalysis.user_id == current_user.id)
+        .order_by(EmailAnalysis.created_at.desc())
+        .limit(limit)
+        .all()
+    ):
+        events.append(_build_analysis_event(item))
+
+    for item in (
+        db.query(MediaAnalysis)
+        .filter(MediaAnalysis.user_id == current_user.id)
+        .order_by(MediaAnalysis.created_at.desc())
+        .limit(limit)
+        .all()
+    ):
+        events.append(_build_media_event(item))
+
+    filtered = []
+    for event in events:
+        created_at = datetime.fromisoformat(event["created_at"]) if event.get("created_at") else None
+        if normalized_source and normalized_source != "all" and event.get("event_type") != normalized_source:
+            continue
+        if normalized_level not in {"", "all", "unknown"} and _normalize_level(event.get("threat_level")) != normalized_level:
+            continue
+        if not _in_range(created_at, cutoff):
+            continue
+        filtered.append(event)
+
+    filtered.sort(key=lambda item: item.get("created_at") or "", reverse=True)
+    filtered = filtered[:limit]
+
+    return {
+        "success": True,
+        "items": filtered,
+        "stats": {
+            "total": len(filtered),
+            "high_attention": len(
+                [
+                    item
+                    for item in filtered
+                    if _normalize_level(item.get("threat_level")) in {"suspicious", "threat"}
+                ]
+            ),
+            "sources": sorted({item["event_type"] for item in filtered}),
+        },
+    }
+
+
+@router.get("/ioc/{ioc_type}/{indicator:path}")
+def ioc_details(
+    ioc_type: str,
+    indicator: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    normalized_type = (ioc_type or "").strip().lower()
+    normalized_indicator = _normalize_indicator(normalized_type, indicator)
+
+    scan_matches = (
+        db.query(ScanHistory)
+        .filter(
+            ScanHistory.user_id == current_user.id,
+            ScanHistory.normalized_indicator == normalized_indicator,
+        )
+        .order_by(ScanHistory.created_at.desc())
+        .limit(20)
+        .all()
+    )
+
+    community_matches = [
+        item
+        for item in db.query(CommunityThreat).order_by(CommunityThreat.published_at.desc()).limit(200).all()
+        if _normalize_indicator(item.threat_type, item.indicator) == normalized_indicator
+    ][:20]
+
+    analysis_matches = (
+        db.query(EmailAnalysis)
+        .filter(
+            EmailAnalysis.user_id == current_user.id,
+            EmailAnalysis.content.ilike(f"%{indicator}%"),
+        )
+        .order_by(EmailAnalysis.created_at.desc())
+        .limit(12)
+        .all()
+    )
+
+    media_matches = (
+        db.query(MediaAnalysis)
+        .filter(
+            MediaAnalysis.user_id == current_user.id,
+            MediaAnalysis.ocr_text.ilike(f"%{indicator}%"),
+        )
+        .order_by(MediaAnalysis.created_at.desc())
+        .limit(12)
+        .all()
+    )
+
+    observation_matches = []
+    geo = None
+    if normalized_type == "ip":
+        observation_matches = (
+            db.query(IPScanObservation)
+            .filter(IPScanObservation.ip == indicator)
+            .order_by(IPScanObservation.created_at.desc())
+            .limit(12)
+            .all()
+        )
+        latest_observation = observation_matches[0] if observation_matches else None
+        if latest_observation and latest_observation.latitude is not None and latest_observation.longitude is not None:
+            geo = {
+                "country": latest_observation.country or "Unknown",
+                "city": latest_observation.city or "",
+                "region": latest_observation.region or "",
+                "isp": latest_observation.isp or "",
+                "organization": latest_observation.organization or "",
+                "latitude": latest_observation.latitude,
+                "longitude": latest_observation.longitude,
+                "location_name": ", ".join(part for part in [latest_observation.city, latest_observation.country] if part) or "Unknown location",
+            }
+        else:
+            resolved_geo = get_ip_geo(indicator)
+            if resolved_geo.get("lat") is not None and resolved_geo.get("lon") is not None:
+                geo = {
+                    "country": resolved_geo.get("country") or "Unknown",
+                    "city": resolved_geo.get("city") or "",
+                    "region": resolved_geo.get("region") or "",
+                    "isp": resolved_geo.get("isp") or "",
+                    "organization": resolved_geo.get("org") or "",
+                    "latitude": resolved_geo.get("lat"),
+                    "longitude": resolved_geo.get("lon"),
+                    "location_name": ", ".join(part for part in [resolved_geo.get("city"), resolved_geo.get("country")] if part) or "Unknown location",
+                }
+
+    risk_values = [
+        *(item.risk_score or 0 for item in scan_matches),
+        *(item.risk_score or 0 for item in community_matches),
+        *(item.risk_score or 0 for item in media_matches),
+        *(item.risk_score or 0 for item in observation_matches),
+    ]
+    latest_level = "unknown"
+    latest_candidates = []
+    if scan_matches:
+        latest_candidates.append((scan_matches[0].created_at, _normalize_level(scan_matches[0].threat_level)))
+    if community_matches:
+        latest_candidates.append((community_matches[0].published_at, _normalize_level(community_matches[0].threat_level)))
+    if media_matches:
+        latest_candidates.append((media_matches[0].created_at, _normalize_level(media_matches[0].threat_level)))
+    if analysis_matches:
+        latest_candidates.append((analysis_matches[0].created_at, _normalize_level(analysis_matches[0].threat_level)))
+    if observation_matches:
+        latest_candidates.append((observation_matches[0].created_at, _normalize_level(observation_matches[0].threat_level)))
+    if latest_candidates:
+        latest_level = sorted(latest_candidates, key=lambda item: item[0] or datetime.min, reverse=True)[0][1]
+
+    source_breakdown = {
+        "scan_history": len(scan_matches),
+        "community": len(community_matches),
+        "analyses": len(analysis_matches),
+        "media": len(media_matches),
+        "observations": len(observation_matches),
+    }
+
+    return {
+        "success": True,
+        "ioc": {
+            "type": normalized_type,
+            "indicator": indicator,
+            "normalized_indicator": normalized_indicator,
+            "latest_threat_level": latest_level,
+            "average_risk_score": round(sum(risk_values) / len(risk_values), 1) if risk_values else 0,
+            "source_breakdown": source_breakdown,
+            "geo": geo,
+        },
+        "scan_history": [_build_scan_item(item) for item in scan_matches],
+        "community": [
+            {
+                "id": item.id,
+                "threat_type": item.threat_type,
+                "indicator": item.indicator,
+                "risk_score": item.risk_score or 0,
+                "threat_level": _normalize_level(item.threat_level),
+                "summary": item.description or item.title or "Published in the community feed.",
+                "published_at": _iso(item.published_at),
+            }
+            for item in community_matches
+        ],
+        "analyses": [
+            {
+                "id": item.id,
+                "channel": item.channel,
+                "subject": item.subject,
+                "sender": item.sender or item.phone_number,
+                "summary": item.summary or "",
+                "threat_level": _normalize_level(item.threat_level),
+                "created_at": _iso(item.created_at),
+            }
+            for item in analysis_matches
+        ],
+        "media": [
+            {
+                "id": item.id,
+                "filename": item.filename,
+                "media_type": item.media_type,
+                "summary": item.summary or "",
+                "threat_level": _normalize_level(item.threat_level),
+                "created_at": _iso(item.created_at),
+            }
+            for item in media_matches
+        ],
+        "observations": [
+            {
+                "id": item.id,
+                "ip": item.ip,
+                "country": item.country,
+                "city": item.city,
+                "source": item.source,
+                "risk_score": item.risk_score or 0,
+                "threat_level": _normalize_level(item.threat_level),
+                "created_at": _iso(item.created_at),
+            }
+            for item in observation_matches
+        ],
     }
 
 

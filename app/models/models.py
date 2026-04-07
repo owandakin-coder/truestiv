@@ -356,3 +356,23 @@ class IPScanObservation(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     user = relationship("User")
+
+
+class ScanHistory(Base):
+    __tablename__ = "scan_history"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    scan_type = Column(String(30), nullable=False, index=True)
+    indicator = Column(String(500), nullable=False, index=True)
+    normalized_indicator = Column(String(500), nullable=False, index=True)
+    threat_level = Column(String(20), nullable=False, default="safe", index=True)
+    risk_score = Column(Integer, default=0)
+    confidence = Column(Float, default=0)
+    country = Column(String(120))
+    source = Column(String(120), default="scanner")
+    summary = Column(Text)
+    result = Column(JSON, default=dict)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+    user = relationship("User")
