@@ -3,6 +3,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
 from apscheduler.schedulers.background import BackgroundScheduler
+from sqlalchemy import inspect, text
 from app.core.auth import hash_password
 from app.core.config import settings
 from app.core.database import engine, SessionLocal
@@ -44,6 +45,44 @@ app.include_router(admin.router, prefix="/api/admin", tags=["Admin"])
 app.include_router(public_api.router, prefix="/api/public", tags=["Public API"])
 
 
+def ensure_database_schema():
+    inspector = inspect(engine)
+
+    if "community_threats" in inspector.get_table_names():
+        existing_columns = {
+            column["name"] for column in inspector.get_columns("community_threats")
+        }
+        community_threat_alters = {
+            "likes_count": "ALTER TABLE community_threats ADD COLUMN IF NOT EXISTS likes_count INTEGER DEFAULT 0",
+            "comments_count": "ALTER TABLE community_threats ADD COLUMN IF NOT EXISTS comments_count INTEGER DEFAULT 0",
+            "score": "ALTER TABLE community_threats ADD COLUMN IF NOT EXISTS score INTEGER DEFAULT 0",
+            "is_moderated": "ALTER TABLE community_threats ADD COLUMN IF NOT EXISTS is_moderated BOOLEAN DEFAULT FALSE",
+            "title": "ALTER TABLE community_threats ADD COLUMN IF NOT EXISTS title VARCHAR",
+            "description": "ALTER TABLE community_threats ADD COLUMN IF NOT EXISTS description VARCHAR",
+        }
+
+        missing_statements = [
+            statement
+            for column_name, statement in community_threat_alters.items()
+            if column_name not in existing_columns
+        ]
+
+        if missing_statements:
+            with engine.begin() as connection:
+                for statement in missing_statements:
+                    connection.execute(text(statement))
+            logger.info(
+                "Applied community_threats schema sync for columns: %s",
+                ", ".join(
+                    column_name
+                    for column_name in community_threat_alters
+                    if column_name not in existing_columns
+                ),
+            )
+
+    Base.metadata.create_all(bind=engine)
+
+
 def ensure_system_user():
     db = SessionLocal()
     try:
@@ -73,6 +112,8 @@ def ensure_system_user():
 
 @app.on_event("startup")
 def startup_event():
+    ensure_database_schema()
+
     db = SessionLocal()
     try:
         seed_plans(db)

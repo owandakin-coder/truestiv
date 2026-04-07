@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from app.core.database import get_db
 from app.core.auth import get_current_user
-from app.models.models import User, ThreatReport, CommunityThreat
+from app.models.models import User, ThreatReport, CommunityThreat, CommunityLike
 from typing import List
 from datetime import datetime
 from app.schemas.schemas import ThreatPublishRequest
