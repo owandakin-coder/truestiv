@@ -4,6 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
 from apscheduler.schedulers.background import BackgroundScheduler
 from app.core.auth import hash_password
+from app.core.config import settings
 from app.core.database import engine, SessionLocal
 from app.models.models import Base, User
 from app.routers import auth, analysis, trust, community, scanner, notifications
@@ -24,12 +25,8 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://truestiv-frontend.vercel.app",
-        "http://localhost:5000",
-        "http://localhost:5173",
-        "https://truestiv-frontend-5i26o56kp-true-t.vercel.app"
-    ],
+    allow_origins=settings.allowed_origins_list,
+    allow_origin_regex=settings.CORS_ALLOW_ORIGIN_REGEX,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
