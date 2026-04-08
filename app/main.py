@@ -11,7 +11,7 @@ from app.models.models import Base, User
 from app.routers import auth, analysis, trust, community, scanner, notifications
 from app.routers import intelligence, media, admin, public_api
 from app.core.billing import seed_plans
-from app.services.threat_intel import collect_all_intel
+from app.services.threat_intel import collect_all_intel, retry_failed_intel_sources
 
 logger = logging.getLogger(__name__)
 
@@ -129,6 +129,13 @@ def startup_event():
             "interval",
             hours=6,
             id="collect-threat-intel",
+            replace_existing=True,
+        )
+        scheduler.add_job(
+            retry_failed_intel_sources,
+            "interval",
+            minutes=30,
+            id="retry-threat-intel",
             replace_existing=True,
         )
         scheduler.start()

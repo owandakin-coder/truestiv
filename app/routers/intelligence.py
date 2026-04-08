@@ -29,6 +29,10 @@ def _normalize_level(value: str | None) -> str:
     return normalized or "unknown"
 
 
+def _is_actionable_level(value: str | None) -> bool:
+    return _normalize_level(value) in {"suspicious", "threat"}
+
+
 def _normalize_indicator(ioc_type: str, indicator: str) -> str:
     value = (indicator or "").strip()
     if ioc_type in {"url", "ip", "hash", "domain", "email", "phone"}:
@@ -91,6 +95,8 @@ def _collect_geo_markers(db: Session) -> list[dict]:
             continue
         if observation.latitude is None or observation.longitude is None:
             continue
+        if not _is_actionable_level(observation.threat_level):
+            continue
         seen.add(observation.ip)
         markers.append(
             {
@@ -122,6 +128,8 @@ def _collect_geo_markers(db: Session) -> list[dict]:
     for threat in threat_ips:
         ip = (threat.indicator or "").strip()
         if not ip or ip in seen or not IP_PATTERN.match(ip):
+            continue
+        if not _is_actionable_level(threat.threat_level):
             continue
         geo = get_ip_geo(ip)
         if geo.get("lat") is None or geo.get("lon") is None:
@@ -236,6 +244,23 @@ def _build_media_event(item: MediaAnalysis) -> dict:
     }
 
 
+def _dedupe_events(events: list[dict]) -> list[dict]:
+    deduped = []
+    seen = set()
+    for event in sorted(events, key=lambda item: item.get("created_at") or "", reverse=True):
+        key = (
+            event.get("event_type"),
+            event.get("ioc_type"),
+            _normalize_indicator(event.get("ioc_type") or "", event.get("indicator") or event.get("title") or ""),
+            _normalize_level(event.get("threat_level")),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(event)
+    return deduped
+
+
 @router.get("/geo-map")
 def geo_map(
     source: str | None = None,
@@ -302,6 +327,7 @@ def scan_history(
     query = (
         db.query(ScanHistory)
         .filter(ScanHistory.user_id == current_user.id)
+        .filter(ScanHistory.threat_level.in_(["suspicious", "threat", "dangerous"]))
         .order_by(ScanHistory.created_at.desc())
     )
     if scan_type and scan_type.lower() != "all":
@@ -343,18 +369,26 @@ def timeline(
     for item in (
         db.query(ScanHistory)
         .filter(ScanHistory.user_id == current_user.id)
+        .filter(ScanHistory.threat_level.in_(["suspicious", "threat", "dangerous"]))
         .order_by(ScanHistory.created_at.desc())
         .limit(limit)
         .all()
     ):
         events.append(_build_scan_event(item))
 
-    for item in db.query(CommunityThreat).order_by(CommunityThreat.published_at.desc()).limit(limit).all():
+    for item in (
+        db.query(CommunityThreat)
+        .filter(CommunityThreat.threat_level.in_(["suspicious", "threat", "dangerous"]))
+        .order_by(CommunityThreat.published_at.desc())
+        .limit(limit)
+        .all()
+    ):
         events.append(_build_community_event(item))
 
     for item in (
         db.query(EmailAnalysis)
         .filter(EmailAnalysis.user_id == current_user.id)
+        .filter(EmailAnalysis.threat_level.in_(["suspicious", "threat", "dangerous"]))
         .order_by(EmailAnalysis.created_at.desc())
         .limit(limit)
         .all()
@@ -364,6 +398,7 @@ def timeline(
     for item in (
         db.query(MediaAnalysis)
         .filter(MediaAnalysis.user_id == current_user.id)
+        .filter(MediaAnalysis.threat_level.in_(["suspicious", "threat", "dangerous"]))
         .order_by(MediaAnalysis.created_at.desc())
         .limit(limit)
         .all()
@@ -381,8 +416,7 @@ def timeline(
             continue
         filtered.append(event)
 
-    filtered.sort(key=lambda item: item.get("created_at") or "", reverse=True)
-    filtered = filtered[:limit]
+    filtered = _dedupe_events(filtered)[:limit]
 
     return {
         "success": True,
@@ -426,6 +460,7 @@ def ioc_details(
         item
         for item in db.query(CommunityThreat).order_by(CommunityThreat.published_at.desc()).limit(200).all()
         if _normalize_indicator(item.threat_type, item.indicator) == normalized_indicator
+        and _is_actionable_level(item.threat_level)
     ][:20]
 
     analysis_matches = (
@@ -433,6 +468,7 @@ def ioc_details(
         .filter(
             EmailAnalysis.user_id == current_user.id,
             EmailAnalysis.content.ilike(f"%{indicator}%"),
+            EmailAnalysis.threat_level.in_(["suspicious", "threat", "dangerous"]),
         )
         .order_by(EmailAnalysis.created_at.desc())
         .limit(12)
@@ -444,6 +480,7 @@ def ioc_details(
         .filter(
             MediaAnalysis.user_id == current_user.id,
             MediaAnalysis.ocr_text.ilike(f"%{indicator}%"),
+            MediaAnalysis.threat_level.in_(["suspicious", "threat", "dangerous"]),
         )
         .order_by(MediaAnalysis.created_at.desc())
         .limit(12)
@@ -455,7 +492,10 @@ def ioc_details(
     if normalized_type == "ip":
         observation_matches = (
             db.query(IPScanObservation)
-            .filter(IPScanObservation.ip == indicator)
+            .filter(
+                IPScanObservation.ip == indicator,
+                IPScanObservation.threat_level.in_(["suspicious", "threat", "dangerous"]),
+            )
             .order_by(IPScanObservation.created_at.desc())
             .limit(12)
             .all()
@@ -575,6 +615,222 @@ def ioc_details(
             }
             for item in observation_matches
         ],
+    }
+
+
+@router.get("/search")
+def search_intelligence(
+    q: str = Query(default="", min_length=2),
+    limit: int = Query(default=8, ge=1, le=25),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    query_text = q.strip()
+    pattern = f"%{query_text}%"
+
+    scans = (
+        db.query(ScanHistory)
+        .filter(
+            ScanHistory.user_id == current_user.id,
+            ScanHistory.threat_level.in_(["suspicious", "threat", "dangerous"]),
+            (
+                ScanHistory.indicator.ilike(pattern)
+                | ScanHistory.summary.ilike(pattern)
+                | ScanHistory.scan_type.ilike(pattern)
+            ),
+        )
+        .order_by(ScanHistory.created_at.desc())
+        .limit(limit)
+        .all()
+    )
+
+    community = (
+        db.query(CommunityThreat)
+        .filter(
+            CommunityThreat.threat_level.in_(["suspicious", "threat", "dangerous"]),
+            (
+                CommunityThreat.indicator.ilike(pattern)
+                | CommunityThreat.title.ilike(pattern)
+                | CommunityThreat.description.ilike(pattern)
+                | CommunityThreat.threat_type.ilike(pattern)
+            ),
+        )
+        .order_by(CommunityThreat.published_at.desc())
+        .limit(limit)
+        .all()
+    )
+
+    analyses = (
+        db.query(EmailAnalysis)
+        .filter(
+            EmailAnalysis.user_id == current_user.id,
+            EmailAnalysis.threat_level.in_(["suspicious", "threat", "dangerous"]),
+            (
+                EmailAnalysis.sender.ilike(pattern)
+                | EmailAnalysis.subject.ilike(pattern)
+                | EmailAnalysis.content.ilike(pattern)
+                | EmailAnalysis.summary.ilike(pattern)
+            ),
+        )
+        .order_by(EmailAnalysis.created_at.desc())
+        .limit(limit)
+        .all()
+    )
+
+    media = (
+        db.query(MediaAnalysis)
+        .filter(
+            MediaAnalysis.user_id == current_user.id,
+            MediaAnalysis.threat_level.in_(["suspicious", "threat", "dangerous"]),
+            (
+                MediaAnalysis.filename.ilike(pattern)
+                | MediaAnalysis.ocr_text.ilike(pattern)
+                | MediaAnalysis.summary.ilike(pattern)
+            ),
+        )
+        .order_by(MediaAnalysis.created_at.desc())
+        .limit(limit)
+        .all()
+    )
+
+    items = [
+        *[
+            {
+                "id": f"scan-{item.id}",
+                "kind": "scan",
+                "title": item.indicator,
+                "summary": item.summary or "",
+                "threat_level": _normalize_level(item.threat_level),
+                "created_at": _iso(item.created_at),
+                "details_path": _build_ioc_href(item.scan_type, item.indicator),
+            }
+            for item in scans
+        ],
+        *[
+            {
+                "id": f"community-{item.id}",
+                "kind": "community",
+                "title": item.indicator,
+                "summary": item.description or item.title or "",
+                "threat_level": _normalize_level(item.threat_level),
+                "created_at": _iso(item.published_at),
+                "details_path": _build_ioc_href(item.threat_type, item.indicator),
+            }
+            for item in community
+        ],
+        *[
+            {
+                "id": f"analysis-{item.id}",
+                "kind": "analysis",
+                "title": item.subject or item.sender or item.phone_number or "Analysis result",
+                "summary": item.summary or "",
+                "threat_level": _normalize_level(item.threat_level),
+                "created_at": _iso(item.created_at),
+                "details_path": "",
+            }
+            for item in analyses
+        ],
+        *[
+            {
+                "id": f"media-{item.id}",
+                "kind": "media",
+                "title": item.filename or "Media finding",
+                "summary": item.summary or "",
+                "threat_level": _normalize_level(item.threat_level),
+                "created_at": _iso(item.created_at),
+                "details_path": "",
+            }
+            for item in media
+        ],
+    ]
+    items = _dedupe_events(
+        [
+            {
+                "event_type": item["kind"],
+                "ioc_type": item["kind"],
+                "indicator": item["title"],
+                "threat_level": item["threat_level"],
+                "created_at": item["created_at"],
+                **item,
+            }
+            for item in items
+        ]
+    )[: limit * 3]
+    return {"success": True, "items": items}
+
+
+@router.get("/trends")
+def threat_trends(
+    time_range: str = "30d",
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    cutoff = _parse_time_range(time_range)
+    source_counts: dict[str, int] = {}
+    country_counts: dict[str, int] = {}
+    ioc_type_counts: dict[str, int] = {}
+    daily_counts: dict[str, int] = {}
+
+    def add_count(target: dict[str, int], key: str | None):
+        normalized = (key or "Unknown").strip() or "Unknown"
+        target[normalized] = target.get(normalized, 0) + 1
+
+    scan_items = (
+        db.query(ScanHistory)
+        .filter(
+            ScanHistory.user_id == current_user.id,
+            ScanHistory.threat_level.in_(["suspicious", "threat", "dangerous"]),
+        )
+        .order_by(ScanHistory.created_at.desc())
+        .limit(400)
+        .all()
+    )
+    for item in scan_items:
+        if not _in_range(item.created_at, cutoff):
+            continue
+        add_count(source_counts, item.source or "scanner")
+        add_count(country_counts, item.country)
+        add_count(ioc_type_counts, item.scan_type)
+        add_count(daily_counts, (item.created_at.date().isoformat() if item.created_at else "Unknown"))
+
+    community_items = (
+        db.query(CommunityThreat)
+        .filter(CommunityThreat.threat_level.in_(["suspicious", "threat", "dangerous"]))
+        .order_by(CommunityThreat.published_at.desc())
+        .limit(400)
+        .all()
+    )
+    for item in community_items:
+        if not _in_range(item.published_at, cutoff):
+            continue
+        add_count(source_counts, "community")
+        raw_source = item.raw_intel.get("source") if isinstance(item.raw_intel, dict) else None
+        add_count(source_counts, raw_source or "community")
+        add_count(ioc_type_counts, item.threat_type)
+        add_count(daily_counts, (item.published_at.date().isoformat() if item.published_at else "Unknown"))
+
+    return {
+        "success": True,
+        "time_range": time_range,
+        "by_source": sorted(
+            [{"label": label, "count": count} for label, count in source_counts.items()],
+            key=lambda item: item["count"],
+            reverse=True,
+        )[:8],
+        "by_country": sorted(
+            [{"label": label, "count": count} for label, count in country_counts.items() if label != "Unknown"],
+            key=lambda item: item["count"],
+            reverse=True,
+        )[:8],
+        "by_ioc_type": sorted(
+            [{"label": label, "count": count} for label, count in ioc_type_counts.items()],
+            key=lambda item: item["count"],
+            reverse=True,
+        )[:8],
+        "timeline": sorted(
+            [{"label": label, "count": count} for label, count in daily_counts.items()],
+            key=lambda item: item["label"],
+        )[-10:],
     }
 
 

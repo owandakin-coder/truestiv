@@ -31,6 +31,10 @@ def normalize_indicator(scan_type: str, indicator: str) -> str:
     return value
 
 
+def is_actionable_level(value: str | None) -> bool:
+    return str(value or "").strip().lower() in {"suspicious", "threat", "dangerous"}
+
+
 def persist_scan_history(
     db: Session,
     user_id: int,
@@ -39,23 +43,43 @@ def persist_scan_history(
     result: dict,
     source: str = "scanner",
 ) -> None:
-    if not indicator:
+    if not indicator or not is_actionable_level(result.get("threat_level")):
         return
 
     geo = result.get("geo") or {}
+    normalized = normalize_indicator(scan_type, indicator)
+    existing = (
+        db.query(ScanHistory)
+        .filter(
+            ScanHistory.user_id == user_id,
+            ScanHistory.scan_type == scan_type,
+            ScanHistory.normalized_indicator == normalized,
+            ScanHistory.source == source,
+        )
+        .order_by(ScanHistory.created_at.desc())
+        .first()
+    )
+    payload = {
+        "indicator": indicator,
+        "normalized_indicator": normalized,
+        "threat_level": str(result.get("threat_level") or "safe").lower(),
+        "risk_score": int(result.get("aggregated_score") or result.get("risk_score") or 0),
+        "confidence": float(result.get("confidence") or 0),
+        "country": geo.get("country"),
+        "source": source,
+        "summary": result.get("summary") or "",
+        "result": result,
+    }
+    if existing:
+        for key, value in payload.items():
+            setattr(existing, key, value)
+        return
+
     db.add(
         ScanHistory(
             user_id=user_id,
             scan_type=scan_type,
-            indicator=indicator,
-            normalized_indicator=normalize_indicator(scan_type, indicator),
-            threat_level=str(result.get("threat_level") or "safe").lower(),
-            risk_score=int(result.get("aggregated_score") or result.get("risk_score") or 0),
-            confidence=float(result.get("confidence") or 0),
-            country=geo.get("country"),
-            source=source,
-            summary=result.get("summary") or "",
-            result=result,
+            **payload,
         )
     )
 

@@ -9,6 +9,10 @@ from app.services.media_analysis import analyze_media_bytes
 router = APIRouter()
 
 
+def is_actionable_level(value: str | None) -> bool:
+    return str(value or "").strip().lower() in {"suspicious", "threat", "dangerous"}
+
+
 @router.post("/analyze")
 async def analyze_media(
     media_type: str = Form(...),
@@ -21,26 +25,29 @@ async def analyze_media(
         raise HTTPException(status_code=400, detail="Uploaded file is empty")
 
     result = analyze_media_bytes(content, file.filename or "upload", media_type)
-    record = MediaAnalysis(
-        user_id=current_user.id,
-        filename=result["filename"],
-        media_type=result["media_type"],
-        threat_level=result["threat_level"],
-        risk_score=result["risk_score"],
-        summary=result["summary"],
-        ocr_text=result["ocr_text"],
-        deepfake_score=result["deepfake_score"],
-        detected_objects=result["detected_objects"],
-        extra_data=result["metadata"],
-    )
-    db.add(record)
-    db.commit()
-    db.refresh(record)
+    record = None
+    if is_actionable_level(result.get("threat_level")):
+        record = MediaAnalysis(
+            user_id=current_user.id,
+            filename=result["filename"],
+            media_type=result["media_type"],
+            threat_level=result["threat_level"],
+            risk_score=result["risk_score"],
+            summary=result["summary"],
+            ocr_text=result["ocr_text"],
+            deepfake_score=result["deepfake_score"],
+            detected_objects=result["detected_objects"],
+            extra_data=result["metadata"],
+        )
+        db.add(record)
+        db.commit()
+        db.refresh(record)
 
     return {
         "success": True,
-        "id": record.id,
+        "id": record.id if record else None,
         **result,
+        "stored": bool(record),
     }
 
 
@@ -53,6 +60,7 @@ def media_history(
     rows = (
         db.query(MediaAnalysis)
         .filter(MediaAnalysis.user_id == current_user.id)
+        .filter(MediaAnalysis.threat_level.in_(["suspicious", "threat", "dangerous"]))
         .order_by(MediaAnalysis.created_at.desc())
         .limit(limit)
         .all()

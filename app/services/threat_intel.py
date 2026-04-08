@@ -8,7 +8,7 @@ from typing import Dict, Any, List
 from tenacity import retry, stop_after_attempt, wait_exponential
 from app.core.config import settings
 from app.core.database import SessionLocal
-from app.models.models import CommunityThreat
+from app.models.models import CommunityThreat, EnrichmentRetryTask
 
 # Attempt Redis import gracefully
 try:
@@ -27,6 +27,7 @@ ABUSEIPDB_KEY = settings.ABUSEIPDB_API_KEY
 GREYNOISE_KEY = settings.GREYNOISE_API_KEY
 OTX_KEY = getattr(settings, "OTX_API_KEY", "")
 logger = logging.getLogger(__name__)
+FAILED_SOURCES_CACHE_KEY = "trustive:intel:failed_sources"
 
 # Redis connection (if available)
 redis_client = None
@@ -52,6 +53,69 @@ def _cache_get(key: str):
 def _cache_set(key: str, value: str, ttl: int = 300):
     if redis_client:
         redis_client.setex(key, ttl, value)
+
+
+def _register_failed_source(source: str, error: str) -> None:
+    db = SessionLocal()
+    try:
+        if redis_client:
+            redis_client.sadd(FAILED_SOURCES_CACHE_KEY, source)
+
+        task = (
+            db.query(EnrichmentRetryTask)
+            .filter(
+                EnrichmentRetryTask.source == source,
+                EnrichmentRetryTask.task_type == "threat_feed",
+                EnrichmentRetryTask.status == "pending",
+            )
+            .order_by(EnrichmentRetryTask.created_at.desc())
+            .first()
+        )
+        if task:
+            task.attempts = int(task.attempts or 0) + 1
+            task.last_error = error
+        else:
+            db.add(
+                EnrichmentRetryTask(
+                    source=source,
+                    task_type="threat_feed",
+                    attempts=1,
+                    last_error=error,
+                    status="pending",
+                    payload={"source": source},
+                )
+            )
+        db.commit()
+    except Exception:
+        db.rollback()
+        logger.exception("Failed to register retry task for source %s", source)
+    finally:
+        db.close()
+
+
+def _clear_failed_source(source: str) -> None:
+    db = SessionLocal()
+    try:
+        if redis_client:
+            redis_client.srem(FAILED_SOURCES_CACHE_KEY, source)
+        tasks = (
+            db.query(EnrichmentRetryTask)
+            .filter(
+                EnrichmentRetryTask.source == source,
+                EnrichmentRetryTask.task_type == "threat_feed",
+                EnrichmentRetryTask.status == "pending",
+            )
+            .all()
+        )
+        for task in tasks:
+            task.status = "completed"
+            task.last_error = None
+        db.commit()
+    except Exception:
+        db.rollback()
+        logger.exception("Failed to clear retry task for source %s", source)
+    finally:
+        db.close()
 
 
 # ------------------------------
@@ -881,21 +945,27 @@ def save_threats_to_db(threats: List[Dict[str, Any]]) -> int:
     return saved_count
 
 
+FETCHERS = {
+    "otx": lambda: fetch_otx_pulses(days_back=1),
+    "urlhaus": fetch_urlhaus_recent,
+    "abuseipdb": lambda: fetch_abuseipdb_recent(ABUSEIPDB_KEY, days=1),
+    "phishtank": fetch_phish_tank_recent,
+    "ibm_xforce": fetch_ibm_xforce_recent,
+    "cisa_kev": fetch_cisa_kev_recent,
+}
+
+
 def collect_all_intel() -> Dict[str, int]:
     collected_threats: List[Dict[str, Any]] = []
 
-    for fetcher_name, fetcher in (
-        ("otx", lambda: fetch_otx_pulses(days_back=1)),
-        ("urlhaus", fetch_urlhaus_recent),
-        ("abuseipdb", lambda: fetch_abuseipdb_recent(ABUSEIPDB_KEY, days=1)),
-        ("phishtank", fetch_phish_tank_recent),
-        ("ibm_xforce", fetch_ibm_xforce_recent),
-        ("cisa_kev", fetch_cisa_kev_recent),
-    ):
+    for fetcher_name, fetcher in FETCHERS.items():
         try:
-            collected_threats.extend(fetcher())
+            fetched = fetcher()
+            collected_threats.extend(fetched)
+            _clear_failed_source(fetcher_name)
         except Exception as exc:
             logger.exception("Threat intel fetcher %s failed: %s", fetcher_name, exc)
+            _register_failed_source(fetcher_name, str(exc))
 
     saved_count = save_threats_to_db(collected_threats)
     logger.info(
@@ -904,3 +974,47 @@ def collect_all_intel() -> Dict[str, int]:
         saved_count,
     )
     return {"collected": len(collected_threats), "saved": saved_count}
+
+
+def retry_failed_intel_sources() -> Dict[str, int]:
+    db = SessionLocal()
+    retried = 0
+    recovered = 0
+    collected_threats: List[Dict[str, Any]] = []
+
+    try:
+        tasks = (
+            db.query(EnrichmentRetryTask)
+            .filter(
+                EnrichmentRetryTask.task_type == "threat_feed",
+                EnrichmentRetryTask.status == "pending",
+            )
+            .order_by(EnrichmentRetryTask.created_at.asc())
+            .limit(20)
+            .all()
+        )
+    finally:
+        db.close()
+
+    for task in tasks:
+        fetcher = FETCHERS.get(task.source)
+        if not fetcher:
+            continue
+        retried += 1
+        try:
+            fetched = fetcher()
+            if fetched:
+                collected_threats.extend(fetched)
+            _clear_failed_source(task.source)
+            recovered += 1
+        except Exception as exc:
+            logger.exception("Retry for threat intel source %s failed: %s", task.source, exc)
+            _register_failed_source(task.source, str(exc))
+
+    saved_count = save_threats_to_db(collected_threats)
+    return {
+        "retried": retried,
+        "recovered": recovered,
+        "collected": len(collected_threats),
+        "saved": saved_count,
+    }
