@@ -1,8 +1,9 @@
+import ipaddress
 import re
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from app.core.auth import get_current_user
@@ -18,7 +19,7 @@ from app.models.models import (
     ScanHistory,
     User,
 )
-from app.services.threat_intel import collect_all_intel, get_ip_geo
+from app.services.threat_intel import aggregate_ip_intel, collect_all_intel, get_ip_geo
 
 router = APIRouter()
 IP_PATTERN = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
@@ -98,6 +99,10 @@ def _build_ioc_href(ioc_type: str, indicator: str) -> str:
     return f"/ioc/{ioc_type}/{quote(indicator, safe='')}"
 
 
+def _build_ip_lookup_href(indicator: str) -> str:
+    return f"/ip-lookup/{quote(indicator, safe='')}"
+
+
 def _source_confidence(source: str | None) -> float:
     normalized = (source or "").strip().lower()
     return SOURCE_CONFIDENCE.get(normalized, 0.6)
@@ -132,6 +137,41 @@ def _threat_actor_tags(indicator: str, summary: str = "", source: str = "", ioc_
     for tag in tags:
         deduped[tag["tag"]] = max(deduped.get(tag["tag"], 0), tag["confidence"])
     return [{"tag": key, "confidence": value} for key, value in deduped.items()]
+
+
+def _provider_summary(source_item: dict) -> str:
+    if source_item.get("error"):
+        return str(source_item["error"])
+    if source_item.get("total_reports"):
+        return f"{source_item.get('total_reports')} abuse reports"
+    if source_item.get("malicious_votes") is not None:
+        return f"{source_item.get('malicious_votes', 0)} malicious detections"
+    if source_item.get("noise") is True:
+        return "Background internet noise observed"
+    if source_item.get("classification"):
+        return f"Classified as {source_item.get('classification')}"
+    if source_item.get("country") or source_item.get("city"):
+        return ", ".join(part for part in [source_item.get("city"), source_item.get("country")] if part)
+    return "Provider returned contextual metadata"
+
+
+def _unique_values(*values) -> list[str]:
+    seen = set()
+    items = []
+    for value in values:
+        normalized = str(value or "").strip()
+        if not normalized:
+            continue
+        lowered = normalized.lower()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        items.append(normalized)
+    return items
+
+
+def _sorted_recent_events(items: list[dict]) -> list[dict]:
+    return sorted(items, key=lambda item: item.get("created_at") or "", reverse=True)
 
 
 def _collect_geo_markers(db: Session) -> list[dict]:
@@ -798,6 +838,179 @@ def ioc_details(
             }
             for item in observation_matches
         ],
+    }
+
+
+@router.get("/ip-lookup/{ip}")
+def ip_lookup(
+    ip: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    candidate = (ip or "").strip()
+    try:
+        normalized_ip = str(ipaddress.ip_address(candidate))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="A valid IP address is required.") from exc
+
+    dossier = ioc_details(ioc_type="ip", indicator=normalized_ip, db=db, current_user=current_user)
+    intel = aggregate_ip_intel(normalized_ip)
+    geo = intel.get("geo") or {}
+
+    providers = []
+    related_domains = []
+    related_networks = []
+    related_organizations = []
+
+    for item in intel.get("sources", []):
+        source_name = item.get("source") or "Unknown source"
+        confidence_score = _source_confidence(source_name)
+        providers.append(
+            {
+                "source": source_name,
+                "status": "error" if item.get("error") else "ok",
+                "score": item.get("score"),
+                "summary": _provider_summary(item),
+                "confidence_score": round(confidence_score, 2),
+                "confidence_label": _confidence_label(confidence_score),
+                "raw": item,
+            }
+        )
+        if item.get("domain"):
+            related_domains.append(item.get("domain"))
+        if item.get("page_domain"):
+            related_domains.append(item.get("page_domain"))
+        related_networks.extend(
+            [
+                item.get("network"),
+                item.get("as"),
+                item.get("asn"),
+                item.get("as_owner"),
+            ]
+        )
+        related_organizations.extend(
+            [
+                item.get("isp"),
+                item.get("org"),
+                item.get("organization"),
+                item.get("as_owner"),
+            ]
+        )
+
+    related_domains = _unique_values(*related_domains)
+    related_networks = _unique_values(*related_networks)
+    related_organizations = _unique_values(
+        geo.get("isp"),
+        geo.get("organization"),
+        *related_organizations,
+    )
+
+    recent_events = []
+    for item in dossier["scan_history"][:8]:
+        recent_events.append(
+            {
+                "event_type": "scan",
+                "title": f"{str(item.get('scan_type') or 'ip').upper()} scan",
+                "summary": item.get("summary") or "Indicator observed in a scan workflow.",
+                "threat_level": item.get("threat_level"),
+                "created_at": item.get("created_at"),
+                "path": item.get("details_path") or _build_ioc_href("ip", normalized_ip),
+            }
+        )
+    for item in dossier["community"][:8]:
+        recent_events.append(
+            {
+                "event_type": "community",
+                "title": item.get("indicator") or "Community publication",
+                "summary": item.get("summary") or "Published to the community feed.",
+                "threat_level": item.get("threat_level"),
+                "created_at": item.get("published_at"),
+                "path": _build_ioc_href("ip", item.get("indicator") or normalized_ip),
+            }
+        )
+    for item in dossier["analyses"][:6]:
+        recent_events.append(
+            {
+                "event_type": "analysis",
+                "title": item.get("subject") or item.get("sender") or "Analysis match",
+                "summary": item.get("summary") or "Mentioned in an analysis result.",
+                "threat_level": item.get("threat_level"),
+                "created_at": item.get("created_at"),
+                "path": "/analysis",
+            }
+        )
+    for item in dossier["media"][:6]:
+        recent_events.append(
+            {
+                "event_type": "media",
+                "title": item.get("filename") or "Media finding",
+                "summary": item.get("summary") or "Extracted during media analysis.",
+                "threat_level": item.get("threat_level"),
+                "created_at": item.get("created_at"),
+                "path": "/media-lab",
+            }
+        )
+    for item in dossier["observations"][:8]:
+        recent_events.append(
+            {
+                "event_type": "observation",
+                "title": item.get("source") or "IP observation",
+                "summary": ", ".join(part for part in [item.get("city"), item.get("country")] if part) or "Observed in infrastructure telemetry.",
+                "threat_level": item.get("threat_level"),
+                "created_at": item.get("created_at"),
+                "path": _build_ioc_href("ip", item.get("ip") or normalized_ip),
+            }
+        )
+
+    geo_payload = {
+        "country": geo.get("country") or dossier["ioc"].get("geo", {}).get("country") or "Unknown",
+        "city": geo.get("city") or dossier["ioc"].get("geo", {}).get("city") or "",
+        "region": geo.get("region") or dossier["ioc"].get("geo", {}).get("region") or "",
+        "isp": geo.get("isp") or dossier["ioc"].get("geo", {}).get("isp") or "",
+        "organization": geo.get("organization") or dossier["ioc"].get("geo", {}).get("organization") or "",
+        "asn": geo.get("asn") or geo.get("as") or "",
+        "latitude": geo.get("latitude") if geo.get("latitude") is not None else dossier["ioc"].get("geo", {}).get("latitude"),
+        "longitude": geo.get("longitude") if geo.get("longitude") is not None else dossier["ioc"].get("geo", {}).get("longitude"),
+    }
+    geo_payload["location_name"] = (
+        ", ".join(part for part in [geo_payload.get("city"), geo_payload.get("country")] if part)
+        or "Unknown location"
+    )
+
+    sightings = {
+        **(dossier["ioc"].get("source_breakdown") or {}),
+        "total": sum((dossier["ioc"].get("source_breakdown") or {}).values()),
+    }
+
+    return {
+        "success": True,
+        "lookup": {
+            "ip": normalized_ip,
+            "threat_level": intel.get("threat_level") or dossier["ioc"].get("latest_threat_level"),
+            "risk_score": intel.get("aggregated_score", 0),
+            "recommendation": intel.get("recommendation") or "allow",
+            "source_count": len(providers),
+            "source_confidence": dossier["ioc"].get("source_confidence"),
+            "source_confidence_label": dossier["ioc"].get("source_confidence_label"),
+            "threat_actor_tags": dossier["ioc"].get("threat_actor_tags") or [],
+            "geo": geo_payload,
+        },
+        "providers": providers,
+        "sightings": sightings,
+        "related": {
+            "domains": related_domains,
+            "networks": related_networks,
+            "organizations": related_organizations,
+        },
+        "recent_events": _sorted_recent_events(recent_events)[:16],
+        "community": dossier["community"][:10],
+        "scan_history": dossier["scan_history"][:10],
+        "observations": dossier["observations"][:10],
+        "pivots": {
+            "ioc_details_path": _build_ioc_href("ip", normalized_ip),
+            "correlation_path": f"/correlation/ip/{quote(normalized_ip, safe='')}",
+            "map_path": "/propagation",
+        },
     }
 
 
