@@ -1,7 +1,9 @@
 import ipaddress
 import re
 from datetime import datetime, timedelta, timezone
-from urllib.parse import quote
+from email.parser import Parser
+from email.utils import parseaddr
+from urllib.parse import quote, urlparse
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
@@ -19,7 +21,14 @@ from app.models.models import (
     ScanHistory,
     User,
 )
-from app.services.threat_intel import aggregate_ip_intel, collect_all_intel, get_ip_geo
+import requests
+
+from app.services.threat_intel import aggregate_ip_intel, aggregate_url_intel, collect_all_intel, get_ip_geo
+
+try:
+    import dns.resolver as dns_resolver
+except Exception:
+    dns_resolver = None
 
 router = APIRouter()
 IP_PATTERN = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
@@ -100,7 +109,37 @@ def _build_ioc_href(ioc_type: str, indicator: str) -> str:
 
 
 def _build_ip_lookup_href(indicator: str) -> str:
-    return f"/ip-lookup/{quote(indicator, safe='')}"
+    return f"/lookup-center/ip/{quote(indicator, safe='')}"
+
+
+def _build_domain_lookup_href(indicator: str) -> str:
+    return f"/lookup-center/domain/{quote(indicator, safe='')}"
+
+
+def _build_header_analyzer_href() -> str:
+    return "/lookup-center/email-header"
+
+
+def _normalize_domain(value: str | None) -> str:
+    candidate = (value or "").strip().lower()
+    if not candidate:
+        return ""
+    if "://" in candidate:
+        candidate = urlparse(candidate).netloc or candidate
+    candidate = candidate.split("/")[0].split(":")[0].strip(".")
+    return candidate
+
+
+def _parse_rdap_datetime(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 def _source_confidence(source: str | None) -> float:
@@ -172,6 +211,103 @@ def _unique_values(*values) -> list[str]:
 
 def _sorted_recent_events(items: list[dict]) -> list[dict]:
     return sorted(items, key=lambda item: item.get("created_at") or "", reverse=True)
+
+
+def _lookup_dns_records(domain: str) -> dict:
+    if not dns_resolver:
+        return {"a": [], "mx": [], "ns": [], "txt": []}
+
+    record_map = {"A": "a", "MX": "mx", "NS": "ns", "TXT": "txt"}
+    results = {"a": [], "mx": [], "ns": [], "txt": []}
+    for record_type, key in record_map.items():
+        try:
+            answers = dns_resolver.resolve(domain, record_type, lifetime=4)
+            if record_type == "MX":
+                results[key] = [str(answer.exchange).rstrip(".") for answer in answers]
+            elif record_type == "TXT":
+                values = []
+                for answer in answers:
+                    if hasattr(answer, "strings"):
+                        values.append("".join(part.decode("utf-8", errors="ignore") for part in answer.strings))
+                    else:
+                        values.append(str(answer).replace('"', ""))
+                results[key] = values
+            else:
+                results[key] = [str(answer).rstrip(".") for answer in answers]
+        except Exception:
+            results[key] = []
+    return results
+
+
+def _lookup_rdap(domain: str) -> dict:
+    try:
+        response = requests.get(f"https://rdap.org/domain/{domain}", timeout=6)
+        if response.status_code != 200:
+            return {}
+        data = response.json()
+    except Exception:
+        return {}
+
+    registrar = ""
+    for entity in data.get("entities", []):
+        roles = [str(role).lower() for role in entity.get("roles", [])]
+        if "registrar" not in roles:
+            continue
+        vcard = entity.get("vcardArray", [])
+        if len(vcard) > 1:
+            for item in vcard[1]:
+                if item[0] == "fn":
+                    registrar = item[3]
+                    break
+        if registrar:
+            break
+
+    created_at = None
+    for event in data.get("events", []):
+        if str(event.get("eventAction", "")).lower() in {"registration", "registered"}:
+            created_at = _parse_rdap_datetime(event.get("eventDate"))
+            if created_at:
+                break
+
+    age_days = None
+    if created_at:
+        age_days = max(0, int((datetime.now(timezone.utc) - created_at).days))
+
+    return {
+        "registrar": registrar,
+        "created_at": created_at.isoformat() if created_at else None,
+        "age_days": age_days,
+        "status": data.get("status", []),
+        "handle": data.get("handle"),
+        "ldh_name": data.get("ldhName") or domain,
+    }
+
+
+def _extract_domain_from_address(value: str | None) -> str:
+    address = parseaddr(value or "")[1]
+    if "@" not in address:
+        return _normalize_domain(address)
+    return _normalize_domain(address.split("@", 1)[1])
+
+
+def _extract_ips_from_received(received_headers: list[str]) -> list[str]:
+    matches = []
+    pattern = re.compile(r"\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)\b")
+    for header in received_headers:
+        matches.extend(pattern.findall(header or ""))
+    deduped = []
+    seen = set()
+    for item in matches:
+        if item in seen:
+            continue
+        seen.add(item)
+        deduped.append(item)
+    return deduped
+
+
+def _extract_auth_value(source_text: str, key: str) -> str:
+    match = re.search(rf"{key}\s*=\s*([a-zA-Z_-]+)", source_text, re.IGNORECASE)
+    return match.group(1).lower() if match else "unknown"
 
 
 def _collect_geo_markers(db: Session) -> list[dict]:
@@ -1010,6 +1146,339 @@ def ip_lookup(
             "ioc_details_path": _build_ioc_href("ip", normalized_ip),
             "correlation_path": f"/correlation/ip/{quote(normalized_ip, safe='')}",
             "map_path": "/propagation",
+        },
+    }
+
+
+@router.get("/domain-lookup/{domain:path}")
+def domain_lookup(
+    domain: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    normalized_domain = _normalize_domain(domain)
+    if not normalized_domain or "." not in normalized_domain:
+        raise HTTPException(status_code=400, detail="A valid domain is required.")
+
+    rdap = _lookup_rdap(normalized_domain)
+    dns_records = _lookup_dns_records(normalized_domain)
+    related_ips = _unique_values(*(dns_records.get("a") or []))
+    url_intel = aggregate_url_intel(f"https://{normalized_domain}")
+    provider_sources = []
+    for item in url_intel.get("sources", []):
+        source_name = item.get("source") or "Unknown source"
+        confidence_score = _source_confidence(source_name)
+        provider_sources.append(
+            {
+                "source": source_name,
+                "status": "error" if item.get("error") else "ok",
+                "score": item.get("score"),
+                "summary": _provider_summary(item),
+                "confidence_score": round(confidence_score, 2),
+                "confidence_label": _confidence_label(confidence_score),
+                "raw": item,
+            }
+        )
+
+    scan_matches = (
+        db.query(ScanHistory)
+        .filter(
+            ScanHistory.user_id == current_user.id,
+            ScanHistory.threat_level.in_(["suspicious", "threat", "dangerous"]),
+        )
+        .order_by(ScanHistory.created_at.desc())
+        .limit(120)
+        .all()
+    )
+    matching_scans = [
+        item
+        for item in scan_matches
+        if normalized_domain in _normalize_indicator(item.scan_type, item.indicator)
+        or normalized_domain in str((item.result or {}).get("summary") or "").lower()
+    ][:18]
+
+    community_matches = [
+        item
+        for item in db.query(CommunityThreat).order_by(CommunityThreat.published_at.desc()).limit(200).all()
+        if normalized_domain in _normalize_indicator(item.threat_type, item.indicator)
+        or normalized_domain in str(item.description or "").lower()
+        or normalized_domain in str(item.title or "").lower()
+    ][:18]
+
+    analysis_matches = (
+        db.query(EmailAnalysis)
+        .filter(
+            EmailAnalysis.user_id == current_user.id,
+            EmailAnalysis.threat_level.in_(["suspicious", "threat", "dangerous"]),
+        )
+        .order_by(EmailAnalysis.created_at.desc())
+        .limit(80)
+        .all()
+    )
+    matching_analyses = [
+        item
+        for item in analysis_matches
+        if normalized_domain in " ".join(
+            [
+                str(item.content or "").lower(),
+                str(item.sender or "").lower(),
+                str(item.subject or "").lower(),
+            ]
+        )
+    ][:12]
+
+    age_days = rdap.get("age_days")
+    related_ip_payload = []
+    for ip_value in related_ips[:6]:
+        related_ip_payload.append(
+            {
+                "ip": ip_value,
+                "lookup_path": _build_ip_lookup_href(ip_value),
+                "ioc_path": _build_ioc_href("ip", ip_value),
+            }
+        )
+
+    risk_score = int(url_intel.get("aggregated_score") or 0)
+    if age_days is not None and age_days <= 30:
+        risk_score = min(100, risk_score + 12)
+
+    threat_level = url_intel.get("threat_level") or ("suspicious" if risk_score >= 25 else "safe")
+    actor_tags = _threat_actor_tags(
+        normalized_domain,
+        " ".join(
+            [
+                str(item.summary or "") for item in matching_scans
+            ]
+            + [str(item.description or item.title or "") for item in community_matches]
+            + [str(item.summary or "") for item in matching_analyses]
+        ),
+        " ".join(provider.get("source", "") for provider in provider_sources),
+        "domain",
+    )
+
+    recent_events = []
+    for item in matching_scans[:8]:
+        recent_events.append(
+            {
+                "event_type": "scan",
+                "title": f"{str(item.scan_type).upper()} scan",
+                "summary": item.summary or "Domain surfaced in scan history.",
+                "threat_level": _normalize_level(item.threat_level),
+                "created_at": _iso(item.created_at),
+                "path": _build_ioc_href(item.scan_type, item.indicator),
+            }
+        )
+    for item in community_matches[:8]:
+        recent_events.append(
+            {
+                "event_type": "community",
+                "title": item.indicator,
+                "summary": item.description or item.title or "Domain surfaced in public community intelligence.",
+                "threat_level": _normalize_level(item.threat_level),
+                "created_at": _iso(item.published_at),
+                "path": _build_ioc_href(item.threat_type, item.indicator),
+            }
+        )
+    for item in matching_analyses[:6]:
+        recent_events.append(
+            {
+                "event_type": "analysis",
+                "title": item.subject or item.sender or "Analysis match",
+                "summary": item.summary or "Domain surfaced in an analysis flow.",
+                "threat_level": _normalize_level(item.threat_level),
+                "created_at": _iso(item.created_at),
+                "path": "/analysis",
+            }
+        )
+
+    return {
+        "success": True,
+        "lookup": {
+            "domain": normalized_domain,
+            "registrar": rdap.get("registrar") or "Unknown",
+            "created_at": rdap.get("created_at"),
+            "age_days": age_days,
+            "threat_level": threat_level,
+            "risk_score": risk_score,
+            "recommendation": url_intel.get("recommendation") or ("quarantine" if risk_score >= 25 else "allow"),
+            "source_count": len(provider_sources),
+            "source_confidence": round(
+                sum(item["confidence_score"] for item in provider_sources) / max(1, len(provider_sources)),
+                2,
+            ) if provider_sources else 0.6,
+            "source_confidence_label": _confidence_label(
+                sum(item["confidence_score"] for item in provider_sources) / max(1, len(provider_sources))
+            ) if provider_sources else "moderate",
+            "threat_actor_tags": actor_tags,
+        },
+        "dns": dns_records,
+        "providers": provider_sources,
+        "related_ips": related_ip_payload,
+        "sightings": {
+            "scan_history": len(matching_scans),
+            "community": len(community_matches),
+            "analyses": len(matching_analyses),
+            "total": len(matching_scans) + len(community_matches) + len(matching_analyses),
+        },
+        "recent_events": _sorted_recent_events(recent_events)[:16],
+        "pivots": {
+            "ioc_details_path": _build_ioc_href("domain", normalized_domain),
+            "correlation_path": f"/correlation/domain/{quote(normalized_domain, safe='')}",
+        },
+    }
+
+
+@router.post("/email-header/analyze")
+def analyze_email_header(
+    payload: dict,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    raw_headers = str(payload.get("headers") or "").strip()
+    if not raw_headers:
+        raise HTTPException(status_code=400, detail="Email headers are required.")
+
+    parsed = Parser().parsestr(raw_headers)
+    received_headers = parsed.get_all("Received", []) or []
+    auth_blob = " ".join(
+        [
+            raw_headers,
+            " ".join(parsed.get_all("Authentication-Results", []) or []),
+            " ".join(parsed.get_all("Received-SPF", []) or []),
+        ]
+    )
+
+    from_header = parsed.get("From", "")
+    reply_to_header = parsed.get("Reply-To", "")
+    return_path_header = parsed.get("Return-Path", "")
+    message_id_header = parsed.get("Message-ID", "")
+    subject_header = parsed.get("Subject", "")
+
+    from_domain = _extract_domain_from_address(from_header)
+    reply_to_domain = _extract_domain_from_address(reply_to_header)
+    return_path_domain = _extract_domain_from_address(return_path_header)
+    extracted_ips = _extract_ips_from_received(received_headers)
+    origin_ip = extracted_ips[-1] if extracted_ips else ""
+    header_domains = _unique_values(
+        from_domain,
+        reply_to_domain,
+        return_path_domain,
+        *[
+            _normalize_domain(item)
+            for item in re.findall(r"(?:[a-zA-Z0-9-]+\.)+[a-zA-Z]{2,24}", raw_headers)
+        ],
+    )
+
+    spf_status = _extract_auth_value(auth_blob, "spf")
+    dkim_status = _extract_auth_value(auth_blob, "dkim")
+    dmarc_status = _extract_auth_value(auth_blob, "dmarc")
+
+    findings = []
+    risk_score = 8
+    if from_domain and reply_to_domain and from_domain != reply_to_domain:
+        findings.append("Reply-To domain does not match the visible sender domain.")
+        risk_score += 22
+    if from_domain and return_path_domain and from_domain != return_path_domain:
+        findings.append("Return-Path domain does not match the visible sender domain.")
+        risk_score += 18
+    if spf_status in {"fail", "softfail", "temperror", "permerror"}:
+        findings.append(f"SPF returned {spf_status}.")
+        risk_score += 24
+    if dkim_status in {"fail", "temperror", "permerror", "none"}:
+        findings.append(f"DKIM returned {dkim_status}.")
+        risk_score += 18
+    if dmarc_status in {"fail", "temperror", "permerror", "none"}:
+        findings.append(f"DMARC returned {dmarc_status}.")
+        risk_score += 20
+    if origin_ip:
+        findings.append(f"Origin IP extracted from Received chain: {origin_ip}.")
+        risk_score += 6
+    if len(received_headers) <= 1:
+        findings.append("Very short Received chain may indicate limited delivery context.")
+        risk_score += 8
+
+    risk_score = min(100, risk_score)
+    if risk_score >= 65:
+        threat_level = "threat"
+        recommendation = "quarantine"
+    elif risk_score >= 30:
+        threat_level = "suspicious"
+        recommendation = "review"
+    else:
+        threat_level = "safe"
+        recommendation = "allow"
+
+    domain_pivots = [
+        {
+            "domain": item,
+            "lookup_path": _build_domain_lookup_href(item),
+            "ioc_path": _build_ioc_href("domain", item),
+        }
+        for item in header_domains[:8]
+    ]
+    ip_pivots = [
+        {
+            "ip": item,
+            "lookup_path": _build_ip_lookup_href(item),
+            "ioc_path": _build_ioc_href("ip", item),
+        }
+        for item in extracted_ips[:8]
+    ]
+
+    related_analyses = []
+    if from_domain:
+        related_analyses = (
+            db.query(EmailAnalysis)
+            .filter(
+                EmailAnalysis.user_id == current_user.id,
+                EmailAnalysis.threat_level.in_(["suspicious", "threat", "dangerous"]),
+                EmailAnalysis.sender.ilike(f"%{from_domain}%"),
+            )
+            .order_by(EmailAnalysis.created_at.desc())
+            .limit(8)
+            .all()
+        )
+
+    return {
+        "success": True,
+        "analysis": {
+            "subject": subject_header,
+            "message_id": message_id_header,
+            "from": from_header,
+            "reply_to": reply_to_header,
+            "return_path": return_path_header,
+            "from_domain": from_domain,
+            "reply_to_domain": reply_to_domain,
+            "return_path_domain": return_path_domain,
+            "origin_ip": origin_ip,
+            "threat_level": threat_level,
+            "risk_score": risk_score,
+            "recommendation": recommendation,
+            "summary": " ".join(findings[:3]) or "Header analysis did not reveal high-risk misalignment.",
+        },
+        "authentication": {
+            "spf": spf_status,
+            "dkim": dkim_status,
+            "dmarc": dmarc_status,
+        },
+        "received_chain": received_headers,
+        "findings": findings,
+        "pivot_domains": domain_pivots,
+        "pivot_ips": ip_pivots,
+        "related_analyses": [
+            {
+                "id": item.id,
+                "channel": item.channel,
+                "subject": item.subject,
+                "sender": item.sender or item.phone_number,
+                "summary": item.summary or "",
+                "threat_level": _normalize_level(item.threat_level),
+                "created_at": _iso(item.created_at),
+            }
+            for item in related_analyses
+        ],
+        "pivots": {
+            "lookup_center_path": _build_header_analyzer_href(),
         },
     }
 
