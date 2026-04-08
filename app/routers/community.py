@@ -140,7 +140,8 @@ def publish_threat(
         threat_level=(data.threat_level or "suspicious").lower(),
         source_analysis_id=data.analysis_id,
         published_by=current_user.id,
-        raw_intel=[]
+        raw_intel={"source": "community", "published_via": "public_workspace"},
+        is_moderated=True,
     )
 
     db.add(threat)
@@ -161,7 +162,16 @@ def publish_threat(
 
 @router.get("/threats")
 def get_community_threats(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    threats = db.query(CommunityThreat).order_by(CommunityThreat.published_at.desc()).limit(50).all()
+    threats = (
+        db.query(CommunityThreat)
+        .filter(
+            CommunityThreat.is_moderated == True,
+            CommunityThreat.threat_level.in_(["suspicious", "threat", "dangerous"]),
+        )
+        .order_by(CommunityThreat.published_at.desc())
+        .limit(50)
+        .all()
+    )
 
     return [
         {

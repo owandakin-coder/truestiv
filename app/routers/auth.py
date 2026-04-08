@@ -1,3 +1,4 @@
+import re
 import secrets
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
@@ -7,6 +8,7 @@ from app.models.models import User
 from app.schemas.schemas import UserCreate, UserResponse, Token, LoginRequest
 
 router = APIRouter()
+GUEST_BROWSER_ID_PATTERN = re.compile(r"^[a-zA-Z0-9_-]{8,64}$")
 
 @router.post("/register", response_model=UserResponse)
 def register(user_data: UserCreate, db: Session = Depends(get_db)):
@@ -48,18 +50,29 @@ def login(login_data: LoginRequest, db: Session = Depends(get_db)):
 
 
 @router.post("/guest", response_model=Token)
-def guest_access(db: Session = Depends(get_db)):
-    guest_id = secrets.token_hex(6)
-    guest_user = User(
-        email=f"guest+{guest_id}@trustive.ai",
-        username=f"guest_{guest_id}",
-        hashed_password=hash_password(secrets.token_urlsafe(24)),
-        is_active=True,
-    )
+def guest_access(payload: dict | None = None, db: Session = Depends(get_db)):
+    requested_browser_id = ""
+    if isinstance(payload, dict):
+        requested_browser_id = str(payload.get("browser_id") or "").strip().lower()
 
-    db.add(guest_user)
-    db.commit()
-    db.refresh(guest_user)
+    if not GUEST_BROWSER_ID_PATTERN.fullmatch(requested_browser_id):
+        requested_browser_id = secrets.token_hex(12)
+
+    guest_email = f"guest+{requested_browser_id}@trustive.ai"
+    guest_username = f"guest_{requested_browser_id.replace('-', '_')[:64]}"
+
+    guest_user = db.query(User).filter(User.email == guest_email).first()
+    if guest_user is None:
+        guest_user = User(
+            email=guest_email,
+            username=guest_username,
+            hashed_password=hash_password(secrets.token_urlsafe(24)),
+            is_active=True,
+        )
+
+        db.add(guest_user)
+        db.commit()
+        db.refresh(guest_user)
 
     access_token = create_access_token(data={"sub": guest_user.email})
     return {"access_token": access_token, "token_type": "bearer"}
