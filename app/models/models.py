@@ -391,3 +391,15 @@ class EnrichmentRetryTask(Base):
     status = Column(String(20), default="pending", index=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+
+class BackgroundJobRun(Base):
+    __tablename__ = "background_job_runs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    job_name = Column(String(120), nullable=False, index=True)
+    status = Column(String(20), nullable=False, default="running", index=True)
+    message = Column(Text)
+    stats = Column(JSON, default=dict)
+    started_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)
+    finished_at = Column(DateTime(timezone=True))

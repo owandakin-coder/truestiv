@@ -1,4 +1,5 @@
 import logging
+from datetime import datetime
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
@@ -7,7 +8,7 @@ from sqlalchemy import inspect, text
 from app.core.auth import hash_password
 from app.core.config import settings
 from app.core.database import engine, SessionLocal
-from app.models.models import Base, User
+from app.models.models import BackgroundJobRun, Base, User
 from app.routers import auth, analysis, trust, community, scanner, notifications
 from app.routers import intelligence, media, admin, public_api
 from app.core.billing import seed_plans
@@ -110,6 +111,53 @@ def ensure_system_user():
         db.close()
 
 
+def run_logged_job(job_name: str, job_callable):
+    db = SessionLocal()
+    job_run = BackgroundJobRun(job_name=job_name, status="running", stats={})
+    try:
+        db.add(job_run)
+        db.commit()
+        db.refresh(job_run)
+    finally:
+        db.close()
+
+    try:
+        result = job_callable() or {}
+        db = SessionLocal()
+        try:
+            stored = db.query(BackgroundJobRun).filter(BackgroundJobRun.id == job_run.id).first()
+            if stored:
+                stored.status = "success"
+                stored.stats = result if isinstance(result, dict) else {"result": str(result)}
+                stored.message = "Completed successfully"
+                stored.finished_at = datetime.utcnow()
+                db.commit()
+        finally:
+            db.close()
+        return result
+    except Exception as exc:
+        logger.exception("Background job %s failed: %s", job_name, exc)
+        db = SessionLocal()
+        try:
+            stored = db.query(BackgroundJobRun).filter(BackgroundJobRun.id == job_run.id).first()
+            if stored:
+                stored.status = "failed"
+                stored.message = str(exc)
+                stored.finished_at = datetime.utcnow()
+                db.commit()
+        finally:
+            db.close()
+        raise
+
+
+def run_collect_threat_intel():
+    return run_logged_job("collect-threat-intel", collect_all_intel)
+
+
+def run_retry_threat_intel():
+    return run_logged_job("retry-threat-intel", retry_failed_intel_sources)
+
+
 @app.on_event("startup")
 def startup_event():
     ensure_database_schema()
@@ -125,14 +173,14 @@ def startup_event():
     if not hasattr(app.state, "scheduler"):
         scheduler = BackgroundScheduler()
         scheduler.add_job(
-            collect_all_intel,
+            run_collect_threat_intel,
             "interval",
             hours=6,
             id="collect-threat-intel",
             replace_existing=True,
         )
         scheduler.add_job(
-            retry_failed_intel_sources,
+            run_retry_threat_intel,
             "interval",
             minutes=30,
             id="retry-threat-intel",

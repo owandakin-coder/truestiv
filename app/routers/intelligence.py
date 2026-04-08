@@ -9,8 +9,10 @@ from app.core.auth import get_current_user
 from app.core.config import settings
 from app.core.database import get_db
 from app.models.models import (
+    BackgroundJobRun,
     CommunityThreat,
     EmailAnalysis,
+    EnrichmentRetryTask,
     IPScanObservation,
     MediaAnalysis,
     ScanHistory,
@@ -20,6 +22,23 @@ from app.services.threat_intel import collect_all_intel, get_ip_geo
 
 router = APIRouter()
 IP_PATTERN = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
+SOURCE_CONFIDENCE = {
+    "alienvault otx": 0.72,
+    "urlhaus": 0.92,
+    "abuseipdb": 0.88,
+    "phishtank": 0.9,
+    "ibm x-force": 0.8,
+    "cisa kev": 0.96,
+    "community": 0.62,
+    "analysis": 0.66,
+    "media": 0.68,
+    "scanner": 0.74,
+    "scanner_enhanced": 0.84,
+    "scanner_ip": 0.78,
+    "scanner_url": 0.76,
+    "scanner_hash": 0.9,
+    "scanner_file": 0.7,
+}
 
 
 def _normalize_level(value: str | None) -> str:
@@ -77,6 +96,42 @@ def _in_range(value, cutoff: datetime | None) -> bool:
 
 def _build_ioc_href(ioc_type: str, indicator: str) -> str:
     return f"/ioc/{ioc_type}/{quote(indicator, safe='')}"
+
+
+def _source_confidence(source: str | None) -> float:
+    normalized = (source or "").strip().lower()
+    return SOURCE_CONFIDENCE.get(normalized, 0.6)
+
+
+def _confidence_label(score: float) -> str:
+    if score >= 0.9:
+        return "high"
+    if score >= 0.75:
+        return "strong"
+    if score >= 0.6:
+        return "moderate"
+    return "low"
+
+
+def _threat_actor_tags(indicator: str, summary: str = "", source: str = "", ioc_type: str = "") -> list[dict]:
+    text = " ".join([indicator or "", summary or "", source or "", ioc_type or ""]).lower()
+    tags = []
+    if any(term in text for term in ["login", "verify", "credential", "phish", "bank", "paypal"]):
+        tags.append({"tag": "Phishing Infrastructure", "confidence": 0.86})
+    if any(term in text for term in ["wallet", "seed", "crypto", "metamask"]):
+        tags.append({"tag": "Crypto Theft Campaign", "confidence": 0.78})
+    if any(term in text for term in ["invoice", "wire", "payment", "ceo", "finance"]):
+        tags.append({"tag": "Business Email Compromise", "confidence": 0.74})
+    if any(term in text for term in ["loader", "malware", "payload", "trojan", "hash"]):
+        tags.append({"tag": "Malware Delivery", "confidence": 0.72})
+    if ioc_type == "ip" and any(term in text for term in ["tor", "relay", "anonymous", "vpn"]):
+        tags.append({"tag": "Anonymous Infrastructure", "confidence": 0.68})
+    if any(term in text for term in ["kit", "landing", "panel", "urlhaus"]):
+        tags.append({"tag": "Phishing Kit", "confidence": 0.64})
+    deduped = {}
+    for tag in tags:
+        deduped[tag["tag"]] = max(deduped.get(tag["tag"], 0), tag["confidence"])
+    return [{"tag": key, "confidence": value} for key, value in deduped.items()]
 
 
 def _collect_geo_markers(db: Session) -> list[dict]:
@@ -162,6 +217,7 @@ def _collect_geo_markers(db: Session) -> list[dict]:
 
 
 def _build_scan_item(item: ScanHistory) -> dict:
+    confidence_score = _source_confidence(item.source or "scanner")
     return {
         "id": item.id,
         "scan_type": item.scan_type,
@@ -172,12 +228,16 @@ def _build_scan_item(item: ScanHistory) -> dict:
         "country": item.country,
         "source": item.source or "scanner",
         "summary": item.summary or "",
+        "source_confidence": confidence_score,
+        "source_confidence_label": _confidence_label(confidence_score),
+        "actor_tags": _threat_actor_tags(item.indicator, item.summary or "", item.source or "scanner", item.scan_type),
         "created_at": _iso(item.created_at),
         "details_path": _build_ioc_href(item.scan_type, item.indicator),
     }
 
 
 def _build_scan_event(item: ScanHistory) -> dict:
+    confidence_score = _source_confidence(item.source or "scanner")
     return {
         "id": f"scan-{item.id}",
         "event_type": "scan",
@@ -189,12 +249,18 @@ def _build_scan_event(item: ScanHistory) -> dict:
         "threat_level": _normalize_level(item.threat_level),
         "risk_score": item.risk_score or 0,
         "country": item.country,
+        "source_confidence": confidence_score,
+        "source_confidence_label": _confidence_label(confidence_score),
+        "actor_tags": _threat_actor_tags(item.indicator, item.summary or "", item.source or "scanner", item.scan_type),
         "created_at": _iso(item.created_at),
         "details_path": _build_ioc_href(item.scan_type, item.indicator),
     }
 
 
 def _build_community_event(item: CommunityThreat) -> dict:
+    intel_source = item.raw_intel.get("source") if isinstance(item.raw_intel, dict) else "community"
+    summary = item.description or "A community-visible threat indicator was published."
+    confidence_score = _source_confidence(intel_source or "community")
     return {
         "id": f"community-{item.id}",
         "event_type": "community",
@@ -202,9 +268,12 @@ def _build_community_event(item: CommunityThreat) -> dict:
         "ioc_type": item.threat_type,
         "indicator": item.indicator,
         "title": item.title or f"{str(item.threat_type or 'indicator').upper()} promoted to community",
-        "summary": item.description or "A community-visible threat indicator was published.",
+        "summary": summary,
         "threat_level": _normalize_level(item.threat_level),
         "risk_score": item.risk_score or 0,
+        "source_confidence": confidence_score,
+        "source_confidence_label": _confidence_label(confidence_score),
+        "actor_tags": _threat_actor_tags(item.indicator, summary, intel_source or "community", item.threat_type),
         "created_at": _iso(item.published_at),
         "details_path": _build_ioc_href(item.threat_type, item.indicator),
     }
@@ -215,6 +284,7 @@ def _build_analysis_event(item: EmailAnalysis) -> dict:
     ioc_type = "email" if item.channel == "email" else "phone"
     confidence = float(item.confidence or 0)
     risk_score = max(0, min(100, int(confidence * 100) if confidence <= 1 else int(confidence)))
+    confidence_score = _source_confidence("analysis")
     return {
         "id": f"analysis-{item.id}",
         "event_type": "analysis",
@@ -225,11 +295,15 @@ def _build_analysis_event(item: EmailAnalysis) -> dict:
         "summary": item.summary or "A message was analyzed by Trustive AI.",
         "threat_level": _normalize_level(item.threat_level),
         "risk_score": risk_score,
+        "source_confidence": confidence_score,
+        "source_confidence_label": _confidence_label(confidence_score),
+        "actor_tags": _threat_actor_tags(indicator, item.summary or "", "analysis", ioc_type),
         "created_at": _iso(item.created_at),
     }
 
 
 def _build_media_event(item: MediaAnalysis) -> dict:
+    confidence_score = _source_confidence("media")
     return {
         "id": f"media-{item.id}",
         "event_type": "media",
@@ -240,6 +314,9 @@ def _build_media_event(item: MediaAnalysis) -> dict:
         "summary": item.summary or "A media artifact was analyzed.",
         "threat_level": _normalize_level(item.threat_level),
         "risk_score": item.risk_score or 0,
+        "source_confidence": confidence_score,
+        "source_confidence_label": _confidence_label(confidence_score),
+        "actor_tags": _threat_actor_tags(item.filename or "", item.summary or "", "media", item.media_type or "media"),
         "created_at": _iso(item.created_at),
     }
 
@@ -296,10 +373,18 @@ def geo_map(
         markers.append(marker)
 
     markers = markers[:limit]
+    playback_points = sorted(
+        {
+            marker["published_at"][:10]
+            for marker in markers
+            if marker.get("published_at")
+        }
+    )
     return {
         "success": True,
         "count": len(markers),
         "markers": markers,
+        "playback_points": playback_points,
         "filters": {
             "source": source or "all",
             "country": country or "all",
@@ -311,6 +396,34 @@ def geo_map(
             "countries": available_countries,
             "threat_levels": available_levels,
         },
+    }
+
+
+@router.get("/geo-map/country-drilldown")
+def geo_map_country_drilldown(
+    country: str,
+    time_range: str = "30d",
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    cutoff = _parse_time_range(time_range)
+    all_markers = _collect_geo_markers(db)
+    normalized_country = (country or "").strip().lower()
+    items = []
+    for marker in all_markers:
+        published_at = datetime.fromisoformat(marker["published_at"]) if marker.get("published_at") else None
+        if marker.get("country", "").lower() != normalized_country:
+            continue
+        if not _in_range(published_at, cutoff):
+            continue
+        items.append(marker)
+
+    items.sort(key=lambda item: item.get("published_at") or "", reverse=True)
+    return {
+        "success": True,
+        "country": country,
+        "count": len(items),
+        "items": items[:60],
     }
 
 
@@ -563,6 +676,76 @@ def ioc_details(
             "normalized_indicator": normalized_indicator,
             "latest_threat_level": latest_level,
             "average_risk_score": round(sum(risk_values) / len(risk_values), 1) if risk_values else 0,
+            "source_confidence": round(
+                (
+                    sum(
+                        [
+                            *[_source_confidence(item.source) for item in scan_matches],
+                            *[
+                                _source_confidence(item.raw_intel.get("source") if isinstance(item.raw_intel, dict) else "community")
+                                for item in community_matches
+                            ],
+                            *[_source_confidence("analysis") for _ in analysis_matches],
+                            *[_source_confidence("media") for _ in media_matches],
+                            *[_source_confidence(item.source) for item in observation_matches],
+                        ]
+                    )
+                    / max(
+                        1,
+                        len(scan_matches)
+                        + len(community_matches)
+                        + len(analysis_matches)
+                        + len(media_matches)
+                        + len(observation_matches),
+                    )
+                ),
+                2,
+            ),
+            "source_confidence_label": _confidence_label(
+                (
+                    sum(
+                        [
+                            *[_source_confidence(item.source) for item in scan_matches],
+                            *[
+                                _source_confidence(item.raw_intel.get("source") if isinstance(item.raw_intel, dict) else "community")
+                                for item in community_matches
+                            ],
+                            *[_source_confidence("analysis") for _ in analysis_matches],
+                            *[_source_confidence("media") for _ in media_matches],
+                            *[_source_confidence(item.source) for item in observation_matches],
+                        ]
+                    )
+                    / max(
+                        1,
+                        len(scan_matches)
+                        + len(community_matches)
+                        + len(analysis_matches)
+                        + len(media_matches)
+                        + len(observation_matches),
+                    )
+                )
+            ),
+            "threat_actor_tags": _threat_actor_tags(
+                indicator,
+                " ".join(
+                    [
+                        *[item.summary or "" for item in scan_matches],
+                        *[(item.description or item.title or "") for item in community_matches],
+                        *[item.summary or "" for item in analysis_matches],
+                        *[item.summary or "" for item in media_matches],
+                    ]
+                ),
+                " ".join(
+                    [
+                        *[(item.source or "scanner") for item in scan_matches],
+                        *[
+                            (item.raw_intel.get("source") if isinstance(item.raw_intel, dict) else "community")
+                            for item in community_matches
+                        ],
+                    ]
+                ),
+                normalized_type,
+            ),
             "source_breakdown": source_breakdown,
             "geo": geo,
         },
@@ -615,6 +798,102 @@ def ioc_details(
             }
             for item in observation_matches
         ],
+    }
+
+
+@router.get("/correlation/{ioc_type}/{indicator:path}")
+def correlation_graph(
+    ioc_type: str,
+    indicator: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    details = ioc_details(ioc_type=ioc_type, indicator=indicator, db=db, current_user=current_user)
+    nodes = [
+        {
+            "id": f"ioc:{ioc_type}:{indicator}",
+            "label": indicator,
+            "type": ioc_type,
+            "group": "indicator",
+            "threat_level": details["ioc"]["latest_threat_level"],
+        }
+    ]
+    edges = []
+
+    for scan in details["scan_history"]:
+        node_id = f"scan:{scan['id']}"
+        nodes.append(
+            {
+                "id": node_id,
+                "label": f"{str(scan['scan_type']).upper()} scan",
+                "type": "scan",
+                "group": "scanner",
+                "summary": scan.get("summary"),
+            }
+        )
+        edges.append({"from": f"ioc:{ioc_type}:{indicator}", "to": node_id, "label": "scanned"})
+
+    for item in details["community"]:
+        node_id = f"community:{item['id']}"
+        nodes.append(
+            {
+                "id": node_id,
+                "label": "Community publication",
+                "type": "community",
+                "group": "community",
+                "summary": item.get("summary"),
+            }
+        )
+        edges.append({"from": f"ioc:{ioc_type}:{indicator}", "to": node_id, "label": "published"})
+
+    for item in details["analyses"]:
+        node_id = f"analysis:{item['id']}"
+        nodes.append(
+            {
+                "id": node_id,
+                "label": item.get("subject") or item.get("sender") or "Analysis",
+                "type": "analysis",
+                "group": "analysis",
+                "summary": item.get("summary"),
+            }
+        )
+        edges.append({"from": f"ioc:{ioc_type}:{indicator}", "to": node_id, "label": "mentioned"})
+
+    for item in details["media"]:
+        node_id = f"media:{item['id']}"
+        nodes.append(
+            {
+                "id": node_id,
+                "label": item.get("filename") or "Media",
+                "type": "media",
+                "group": "media",
+                "summary": item.get("summary"),
+            }
+        )
+        edges.append({"from": f"ioc:{ioc_type}:{indicator}", "to": node_id, "label": "extracted"})
+
+    for item in details["ioc"]["threat_actor_tags"]:
+        node_id = f"tag:{item['tag']}"
+        nodes.append(
+            {
+                "id": node_id,
+                "label": item["tag"],
+                "type": "actor_tag",
+                "group": "tag",
+                "confidence": item["confidence"],
+            }
+        )
+        edges.append({"from": f"ioc:{ioc_type}:{indicator}", "to": node_id, "label": "tagged"})
+
+    seen_nodes = {}
+    for node in nodes:
+        seen_nodes[node["id"]] = node
+
+    return {
+        "success": True,
+        "nodes": list(seen_nodes.values()),
+        "edges": edges,
+        "ioc": details["ioc"],
     }
 
 
@@ -834,6 +1113,86 @@ def threat_trends(
     }
 
 
+@router.get("/jobs/status")
+def background_jobs_status(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    recent_runs = (
+        db.query(BackgroundJobRun)
+        .order_by(BackgroundJobRun.started_at.desc())
+        .limit(20)
+        .all()
+    )
+    latest_by_job = {}
+    for item in recent_runs:
+        latest_by_job.setdefault(item.job_name, item)
+
+    retry_tasks = (
+        db.query(EnrichmentRetryTask)
+        .filter(EnrichmentRetryTask.status == "pending")
+        .order_by(EnrichmentRetryTask.created_at.desc())
+        .all()
+    )
+
+    jobs = [
+        {
+            "job_name": item.job_name,
+            "status": item.status,
+            "message": item.message,
+            "started_at": _iso(item.started_at),
+            "finished_at": _iso(item.finished_at),
+            "stats": item.stats or {},
+        }
+        for item in latest_by_job.values()
+    ]
+
+    return {
+        "success": True,
+        "jobs": sorted(jobs, key=lambda item: item["job_name"]),
+        "retry_queue": [
+            {
+                "id": task.id,
+                "source": task.source,
+                "task_type": task.task_type,
+                "attempts": task.attempts or 0,
+                "last_error": task.last_error,
+                "created_at": _iso(task.created_at),
+            }
+            for task in retry_tasks
+        ],
+    }
+
+
+@router.get("/jobs/history")
+def background_jobs_history(
+    limit: int = Query(default=30, ge=1, le=100),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    items = (
+        db.query(BackgroundJobRun)
+        .order_by(BackgroundJobRun.started_at.desc())
+        .limit(limit)
+        .all()
+    )
+    return {
+        "success": True,
+        "items": [
+            {
+                "id": item.id,
+                "job_name": item.job_name,
+                "status": item.status,
+                "message": item.message,
+                "stats": item.stats or {},
+                "started_at": _iso(item.started_at),
+                "finished_at": _iso(item.finished_at),
+            }
+            for item in items
+        ],
+    }
+
+
 @router.get("/share-preview")
 def share_preview(
     threat_id: int | None = None,
@@ -879,18 +1238,44 @@ def share_preview(
 
 
 @router.get("/sources-status")
-def sources_status(current_user: User = Depends(get_current_user)):
-    return {
-        "success": True,
-        "sources": [
-            {"name": "AlienVault OTX", "type": "ip/url"},
-            {"name": "URLhaus", "type": "url"},
-            {"name": "AbuseIPDB", "type": "ip"},
-            {"name": "PhishTank", "type": "url"},
-            {"name": "IBM X-Force", "type": "ip/url"},
-            {"name": "CISA KEV", "type": "cve"},
-        ],
-    }
+def sources_status(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    pending = (
+        db.query(EnrichmentRetryTask)
+        .filter(
+            EnrichmentRetryTask.status == "pending",
+            EnrichmentRetryTask.task_type == "threat_feed",
+        )
+        .all()
+    )
+    pending_sources = {item.source: item for item in pending}
+    catalog = [
+        {"name": "AlienVault OTX", "key": "otx", "type": "ip/url"},
+        {"name": "URLhaus", "key": "urlhaus", "type": "url"},
+        {"name": "AbuseIPDB", "key": "abuseipdb", "type": "ip"},
+        {"name": "PhishTank", "key": "phishtank", "type": "url"},
+        {"name": "IBM X-Force", "key": "ibm_xforce", "type": "ip/url"},
+        {"name": "CISA KEV", "key": "cisa_kev", "type": "cve"},
+    ]
+    sources = []
+    for item in catalog:
+        task = pending_sources.get(item["key"])
+        confidence_score = _source_confidence(item["name"])
+        sources.append(
+            {
+                "name": item["name"],
+                "key": item["key"],
+                "type": item["type"],
+                "status": "degraded" if task else "healthy",
+                "confidence_score": confidence_score,
+                "confidence_label": _confidence_label(confidence_score),
+                "retry_attempts": task.attempts if task else 0,
+                "last_error": task.last_error if task else None,
+            }
+        )
+    return {"success": True, "sources": sources}
 
 
 @router.post("/collect-now")
