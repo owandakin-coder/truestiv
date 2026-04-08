@@ -10,7 +10,7 @@ from app.core.config import settings
 from app.core.database import engine, SessionLocal
 from app.models.models import BackgroundJobRun, Base, User
 from app.routers import auth, analysis, trust, community, scanner, notifications
-from app.routers import intelligence, media, admin, public_api
+from app.routers import intelligence, media, public_api
 from app.core.billing import seed_plans
 from app.services.threat_intel import collect_all_intel, retry_failed_intel_sources
 
@@ -42,7 +42,6 @@ app.include_router(scanner.router, prefix="/api/scanner", tags=["Scanner"])
 app.include_router(notifications.router, prefix="/api/notifications", tags=["Notifications"])
 app.include_router(intelligence.router, prefix="/api/intelligence", tags=["Threat Intelligence"])
 app.include_router(media.router, prefix="/api/media", tags=["Media Analysis"])
-app.include_router(admin.router, prefix="/api/admin", tags=["Admin"])
 app.include_router(public_api.router, prefix="/api/public", tags=["Public API"])
 
 
@@ -208,7 +207,7 @@ def custom_openapi():
         version="2.1.0",
         description=(
             "Trustive AI provides AI-assisted threat analysis, geographic threat intelligence, "
-            "community sharing, media deepfake detection, and administration endpoints."
+            "community intelligence, media deepfake detection, and public investigation workflows."
         ),
         routes=app.routes,
     )
@@ -221,7 +220,7 @@ def custom_openapi():
         "Threat analysis with transformer-backed classification",
         "Geographic threat map with IP geolocation markers",
         "Media analysis for OCR, object insights, and deepfake heuristics",
-        "Community feed sharing and admin moderation",
+        "Community intelligence and unified investigation pivots",
     ]
     app.openapi_schema = openapi_schema
     return app.openapi_schema
