@@ -1072,7 +1072,7 @@ def ip_lookup(
                 "summary": item.get("summary") or "Mentioned in an analysis result.",
                 "threat_level": item.get("threat_level"),
                 "created_at": item.get("created_at"),
-                "path": "/analysis",
+                "path": "/investigation-center/analysis",
             }
         )
     for item in dossier["media"][:6]:
@@ -1083,7 +1083,7 @@ def ip_lookup(
                 "summary": item.get("summary") or "Extracted during media analysis.",
                 "threat_level": item.get("threat_level"),
                 "created_at": item.get("created_at"),
-                "path": "/media-lab",
+                "path": "/investigation-center/media-lab",
             }
         )
     for item in dossier["observations"][:8]:
@@ -1287,7 +1287,7 @@ def domain_lookup(
                 "summary": item.summary or "Domain surfaced in an analysis flow.",
                 "threat_level": _normalize_level(item.threat_level),
                 "created_at": _iso(item.created_at),
-                "path": "/analysis",
+                "path": "/investigation-center/analysis",
             }
         )
 
@@ -2180,7 +2180,7 @@ def share_preview(
         if analysis:
             title = analysis.subject or f"{analysis.channel.upper()} analysis result"
             summary = analysis.summary or "Trustive AI analysis result ready for sharing."
-            path = f"/analysis?result={analysis.id}"
+            path = f"/investigation-center/analysis?result={analysis.id}"
 
     share_url = f"{getattr(settings, 'BASE_URL', 'http://localhost:8000').rstrip('/')}{path}"
     hashtags = getattr(settings, "DEFAULT_SHARE_HASHTAGS", "TrustiveAI,CyberSecurity,ThreatIntel")

@@ -1,5 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
+from sqlalchemy import func
 from app.core.database import get_db
 from app.core.auth import get_current_user
 from app.models.models import User, ThreatReport, CommunityThreat, CommunityLike
@@ -107,19 +108,12 @@ def publish_threat(
     if not normalized_indicator:
         raise HTTPException(status_code=400, detail="Indicator is required")
 
-    existing_threats = (
-        db.query(CommunityThreat)
-        .filter(CommunityThreat.threat_type == normalized_type)
-        .all()
-    )
-    existing = next(
-        (
-            threat
-            for threat in existing_threats
-            if normalize_indicator(threat.threat_type, threat.indicator) == normalized_indicator
-        ),
-        None,
-    )
+    existing_query = db.query(CommunityThreat).filter(CommunityThreat.threat_type == normalized_type)
+    if normalized_type in {"url", "ip", "hash", "email", "domain", "phone"}:
+        existing_query = existing_query.filter(func.lower(CommunityThreat.indicator) == normalized_indicator)
+    else:
+        existing_query = existing_query.filter(CommunityThreat.indicator == normalized_indicator)
+    existing = existing_query.order_by(CommunityThreat.published_at.desc()).first()
 
     if existing:
         return {
