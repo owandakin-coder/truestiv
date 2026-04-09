@@ -1795,6 +1795,285 @@ def threat_trends(
     }
 
 
+def _collect_recent_signal_events(
+    db: Session,
+    current_user: User,
+    limit: int = 180,
+    include_private: bool = True,
+) -> list[dict]:
+    events = []
+
+    if include_private:
+        for item in (
+            db.query(ScanHistory)
+            .filter(
+                ScanHistory.user_id == current_user.id,
+                ScanHistory.threat_level.in_(["suspicious", "threat", "dangerous"]),
+            )
+            .order_by(ScanHistory.created_at.desc())
+            .limit(limit)
+            .all()
+        ):
+            events.append(_build_scan_event(item))
+
+    for item in (
+        db.query(CommunityThreat)
+        .filter(
+            CommunityThreat.is_moderated == True,
+            CommunityThreat.threat_level.in_(["suspicious", "threat", "dangerous"]),
+        )
+        .order_by(CommunityThreat.published_at.desc())
+        .limit(limit)
+        .all()
+    ):
+        events.append(_build_community_event(item))
+
+    if include_private:
+        for item in (
+            db.query(EmailAnalysis)
+            .filter(
+                EmailAnalysis.user_id == current_user.id,
+                EmailAnalysis.threat_level.in_(["suspicious", "threat", "dangerous"]),
+            )
+            .order_by(EmailAnalysis.created_at.desc())
+            .limit(limit)
+            .all()
+        ):
+            events.append(_build_analysis_event(item))
+
+    if include_private:
+        for item in (
+            db.query(MediaAnalysis)
+            .filter(
+                MediaAnalysis.user_id == current_user.id,
+                MediaAnalysis.threat_level.in_(["suspicious", "threat", "dangerous"]),
+            )
+            .order_by(MediaAnalysis.created_at.desc())
+            .limit(limit)
+            .all()
+        ):
+            events.append(_build_media_event(item))
+
+    return _dedupe_events(events)[:limit]
+
+
+def _build_signal_clusters(events: list[dict]) -> list[dict]:
+    clusters: dict[str, dict] = {}
+
+    for event in events:
+        tags = event.get("actor_tags") or []
+        sources = event.get("source") or event.get("event_type") or "intel"
+        country = event.get("country") or "Unknown"
+        ioc_type = event.get("ioc_type") or "signal"
+        indicator = event.get("indicator") or event.get("title") or "signal"
+        primary_tag = tags[0]["tag"] if tags else ""
+
+        if primary_tag:
+            cluster_id = f"tag:{primary_tag.lower().replace(' ', '-')}"
+            label = primary_tag
+        else:
+            cluster_id = f"{ioc_type}:{country.lower()}:{str(sources).lower()}"
+            label = f"{str(ioc_type).upper()} activity"
+
+        cluster = clusters.setdefault(
+            cluster_id,
+            {
+                "id": cluster_id,
+                "label": label,
+                "latest_threat_level": "safe",
+                "max_risk_score": 0,
+                "latest_seen": event.get("created_at"),
+                "signal_count": 0,
+                "sources": set(),
+                "countries": set(),
+                "actor_tags": set(),
+                "related_indicators": [],
+                "events": [],
+                "details_path": f"/campaign-clusters?cluster={quote(cluster_id, safe='')}",
+            },
+        )
+
+        cluster["signal_count"] += 1
+        cluster["max_risk_score"] = max(cluster["max_risk_score"], int(event.get("risk_score") or 0))
+        cluster["sources"].add(str(sources))
+        if country and country != "Unknown":
+            cluster["countries"].add(country)
+        for tag in tags:
+            if tag.get("tag"):
+                cluster["actor_tags"].add(tag["tag"])
+        if indicator and indicator not in cluster["related_indicators"]:
+            cluster["related_indicators"].append(indicator)
+        cluster["events"].append(
+            {
+                "id": event.get("id"),
+                "title": event.get("title") or indicator,
+                "indicator": indicator,
+                "ioc_type": ioc_type,
+                "source": sources,
+                "summary": event.get("summary") or "",
+                "threat_level": event.get("threat_level") or "unknown",
+                "risk_score": event.get("risk_score") or 0,
+                "created_at": event.get("created_at"),
+                "details_path": event.get("details_path") or "",
+            }
+        )
+        if event.get("created_at") and (cluster["latest_seen"] or "") < event.get("created_at", ""):
+            cluster["latest_seen"] = event.get("created_at")
+        if _normalize_level(event.get("threat_level")) == "threat":
+            cluster["latest_threat_level"] = "threat"
+        elif (
+            _normalize_level(event.get("threat_level")) == "suspicious"
+            and cluster["latest_threat_level"] != "threat"
+        ):
+            cluster["latest_threat_level"] = "suspicious"
+
+    items = []
+    for cluster in clusters.values():
+        sources = sorted(cluster["sources"])
+        countries = sorted(cluster["countries"])
+        actor_tags = sorted(cluster["actor_tags"])
+        related_indicators = cluster["related_indicators"][:8]
+        items.append(
+            {
+                "id": cluster["id"],
+                "label": cluster["label"],
+                "summary": (
+                    f"{cluster['signal_count']} related signals across {len(sources)} sources"
+                    + (f" with country focus on {', '.join(countries[:2])}" if countries else "")
+                    + "."
+                ),
+                "latest_threat_level": cluster["latest_threat_level"],
+                "max_risk_score": cluster["max_risk_score"],
+                "latest_seen": cluster["latest_seen"],
+                "signal_count": cluster["signal_count"],
+                "sources": sources,
+                "countries": countries,
+                "actor_tags": actor_tags,
+                "related_indicators": related_indicators,
+                "events": _sorted_recent_events(cluster["events"])[:12],
+                "details_path": cluster["details_path"],
+            }
+        )
+
+    return sorted(
+        items,
+        key=lambda item: (item["signal_count"], item["max_risk_score"], item["latest_seen"] or ""),
+        reverse=True,
+    )
+
+
+@router.get("/trending-indicators")
+def trending_indicators(
+    time_range: str = "30d",
+    limit: int = Query(default=12, ge=1, le=40),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    cutoff = _parse_time_range(time_range)
+    events = _collect_recent_signal_events(db, current_user, limit=240, include_private=False)
+    buckets: dict[tuple[str, str], dict] = {}
+
+    for event in events:
+        created_at = datetime.fromisoformat(event["created_at"]) if event.get("created_at") else None
+        if not _in_range(created_at, cutoff):
+            continue
+        indicator = (event.get("indicator") or "").strip()
+        ioc_type = (event.get("ioc_type") or "").strip().lower()
+        if not indicator or ioc_type not in {"ip", "url", "hash", "domain", "file", "email", "phone"}:
+            continue
+
+        key = (ioc_type, _normalize_indicator(ioc_type, indicator))
+        item = buckets.setdefault(
+            key,
+            {
+                "indicator": indicator,
+                "ioc_type": ioc_type,
+                "sightings": 0,
+                "latest_threat_level": "safe",
+                "max_risk_score": 0,
+                "latest_seen": event.get("created_at"),
+                "sources": set(),
+                "countries": set(),
+                "details_path": event.get("details_path") or _build_ioc_href(ioc_type, indicator),
+            },
+        )
+        item["sightings"] += 1
+        item["max_risk_score"] = max(item["max_risk_score"], int(event.get("risk_score") or 0))
+        item["sources"].add(str(event.get("source") or event.get("event_type") or "intel"))
+        if event.get("country"):
+            item["countries"].add(str(event.get("country")))
+        if event.get("created_at") and (item["latest_seen"] or "") < event.get("created_at", ""):
+            item["latest_seen"] = event.get("created_at")
+        if _normalize_level(event.get("threat_level")) == "threat":
+            item["latest_threat_level"] = "threat"
+        elif (
+            _normalize_level(event.get("threat_level")) == "suspicious"
+            and item["latest_threat_level"] != "threat"
+        ):
+            item["latest_threat_level"] = "suspicious"
+
+    items = [
+        {
+            **value,
+            "sources": sorted(value["sources"]),
+            "countries": sorted(value["countries"]),
+        }
+        for value in buckets.values()
+    ]
+    items = sorted(
+        items,
+        key=lambda item: (item["sightings"], item["max_risk_score"], item["latest_seen"] or ""),
+        reverse=True,
+    )[:limit]
+    return {"success": True, "items": items}
+
+
+@router.get("/public-incident-briefs")
+def public_incident_briefs(
+    limit: int = Query(default=6, ge=1, le=20),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    clusters = _build_signal_clusters(
+        _collect_recent_signal_events(db, current_user, limit=220, include_private=False)
+    )
+    briefs = []
+    for cluster in clusters[:limit]:
+        briefs.append(
+            {
+                "id": cluster["id"],
+                "title": f"{cluster['label']} brief",
+                "summary": cluster["summary"],
+                "latest_threat_level": cluster["latest_threat_level"],
+                "signal_count": cluster["signal_count"],
+                "max_risk_score": cluster["max_risk_score"],
+                "latest_seen": cluster["latest_seen"],
+                "sources": cluster["sources"][:4],
+                "countries": cluster["countries"][:4],
+                "actor_tags": cluster["actor_tags"][:4],
+                "related_indicators": cluster["related_indicators"][:5],
+                "details_path": cluster["details_path"],
+            }
+        )
+    return {"success": True, "items": briefs}
+
+
+@router.get("/campaign-clusters")
+def campaign_clusters(
+    cluster: str | None = None,
+    limit: int = Query(default=12, ge=1, le=40),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    items = _build_signal_clusters(
+        _collect_recent_signal_events(db, current_user, limit=260, include_private=False)
+    )[:limit]
+    selected = next((item for item in items if item["id"] == (cluster or "").strip()), None)
+    if selected is None and items:
+        selected = items[0]
+    return {"success": True, "items": items, "selected": selected}
+
+
 @router.get("/jobs/status")
 def background_jobs_status(
     db: Session = Depends(get_db),

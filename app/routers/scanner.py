@@ -4,7 +4,7 @@ from app.core.database import get_db
 from app.core.auth import get_current_user
 from app.core.ai_engine import analyze_threat
 from app.models.models import IPScanObservation, ScanHistory, User
-from app.services.threat_intel import aggregate_ip_intel
+from app.services.threat_intel import aggregate_ip_intel, aggregate_url_intel
 from app.core.config import settings
 import re
 import hashlib
@@ -12,8 +12,10 @@ import ipaddress
 import secrets
 import os
 import requests
+from urllib.parse import quote
 
 router = APIRouter()
+DOMAIN_INPUT_PATTERN = re.compile(r"^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,24}$", re.IGNORECASE)
 
 
 def get_virustotal_api_key() -> str:
@@ -121,6 +123,76 @@ def record_ip_scan_observation(db: Session, user_id: int, ip: str, result: dict,
             **payload,
         )
     )
+
+
+def classify_bulk_indicator(value: str) -> str:
+    candidate = (value or "").strip()
+    if not candidate:
+        return "unknown"
+    normalized = candidate.lower()
+    try:
+        ipaddress.ip_address(normalized)
+        return "ip"
+    except ValueError:
+        pass
+    if normalized.startswith(("http://", "https://")):
+        return "url"
+    if DOMAIN_INPUT_PATTERN.fullmatch(normalized):
+        return "domain"
+    if len(normalized) in {32, 40, 64} and all(char in "0123456789abcdef" for char in normalized):
+        return "hash"
+    return "unknown"
+
+
+def analyze_domain_payload(domain: str) -> dict:
+    candidate = (domain or "").strip().lower()
+    if not DOMAIN_INPUT_PATTERN.fullmatch(candidate):
+        raise HTTPException(status_code=400, detail="Invalid domain format")
+
+    intel = aggregate_url_intel(f"https://{candidate}")
+    risk_score = int(intel.get("aggregated_score") or intel.get("risk_score") or 0)
+    return {
+        "success": True,
+        "domain": candidate,
+        "threat_level": str(intel.get("threat_level") or "safe").lower(),
+        "risk_score": risk_score,
+        "confidence": min(95, risk_score + 15) if risk_score > 0 else 78,
+        "recommendation": intel.get("recommendation") or "allow",
+        "summary": intel.get("summary") or "Domain enrichment completed.",
+        "sources": intel.get("sources") or [],
+    }
+
+
+def build_bulk_result_item(ioc_type: str, indicator: str, payload: dict) -> dict:
+    normalized_type = (ioc_type or "").strip().lower()
+    risk_score = int(
+        payload.get("risk_score")
+        or payload.get("aggregated_score")
+        or 0
+    )
+    details_path = ""
+    lookup_path = ""
+    if normalized_type in {"url", "ip", "hash", "domain"}:
+        details_path = f"/ioc/{quote(normalized_type, safe='')}/{quote(indicator, safe='')}"
+    if normalized_type == "ip":
+        lookup_path = f"/lookup-center/ip/{quote(indicator, safe='')}"
+    elif normalized_type == "domain":
+        lookup_path = f"/lookup-center/domain/{quote(indicator, safe='')}"
+
+    return {
+        "indicator": indicator,
+        "ioc_type": normalized_type,
+        "threat_level": str(payload.get("threat_level") or "safe").lower(),
+        "risk_score": risk_score,
+        "confidence": payload.get("confidence"),
+        "summary": payload.get("summary") or "Bulk enrichment completed.",
+        "recommendation": payload.get("recommendation") or "review",
+        "details_path": details_path,
+        "lookup_path": lookup_path,
+        "permalink": payload.get("permalink"),
+        "source_count": len(payload.get("sources") or []),
+        "not_found": bool(payload.get("not_found")),
+    }
 
 SUSPICIOUS_PATTERNS = [
     r'bit\.ly', r'tinyurl', r'goo\.gl', r't\.co',
@@ -595,3 +667,89 @@ def scan_hash(data: dict, db: Session = Depends(get_db), current_user: User = De
     except Exception:
         db.rollback()
     return response
+
+
+@router.post("/bulk")
+def bulk_scan_iocs(data: dict, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    raw_input = str(data.get("input") or "").strip()
+    if not raw_input:
+        raise HTTPException(status_code=400, detail="Bulk input is required")
+
+    lines = [line.strip() for line in raw_input.splitlines() if line.strip()]
+    if not lines:
+        raise HTTPException(status_code=400, detail="No indicators were provided")
+
+    indicators: list[str] = []
+    seen = set()
+    for line in lines:
+        normalized = line.strip()
+        lowered = normalized.lower()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        indicators.append(normalized)
+
+    indicators = indicators[:50]
+    items = []
+    by_type = {"ip": 0, "url": 0, "hash": 0, "domain": 0, "unknown": 0}
+    actionable = 0
+
+    for indicator in indicators:
+        ioc_type = classify_bulk_indicator(indicator)
+        by_type[ioc_type] = by_type.get(ioc_type, 0) + 1
+
+        if ioc_type == "unknown":
+            items.append(
+                {
+                    "indicator": indicator,
+                    "ioc_type": "unknown",
+                    "threat_level": "unknown",
+                    "risk_score": 0,
+                    "summary": "Indicator format was not recognized as IP, URL, HASH, or domain.",
+                    "recommendation": "review",
+                    "details_path": "",
+                    "lookup_path": "",
+                    "source_count": 0,
+                }
+            )
+            continue
+
+        try:
+            if ioc_type == "ip":
+                payload = check_ip_enhanced({"ip": indicator}, db, current_user)
+            elif ioc_type == "url":
+                payload = analyze_url({"url": indicator}, db, current_user)
+            elif ioc_type == "hash":
+                payload = scan_hash({"hash": indicator}, db, current_user)
+            else:
+                payload = analyze_domain_payload(indicator)
+
+            item = build_bulk_result_item(ioc_type, indicator, payload)
+            if item["threat_level"] in {"suspicious", "threat"}:
+                actionable += 1
+            items.append(item)
+        except HTTPException as exc:
+            items.append(
+                {
+                    "indicator": indicator,
+                    "ioc_type": ioc_type,
+                    "threat_level": "unknown",
+                    "risk_score": 0,
+                    "summary": exc.detail if isinstance(exc.detail, str) else "Unable to process this indicator.",
+                    "recommendation": "review",
+                    "details_path": "",
+                    "lookup_path": "",
+                    "source_count": 0,
+                }
+            )
+
+    return {
+        "success": True,
+        "summary": {
+            "submitted": len(lines),
+            "processed": len(indicators),
+            "actionable": actionable,
+            "by_type": by_type,
+        },
+        "items": items,
+    }
