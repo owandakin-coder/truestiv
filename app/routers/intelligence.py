@@ -540,7 +540,7 @@ def geo_map(
         published_at = datetime.fromisoformat(marker["published_at"]) if marker.get("published_at") else None
         if normalized_source and normalized_source not in {"all", marker.get("source", "").lower()}:
             continue
-        if normalized_country and marker.get("country", "").lower() != normalized_country:
+        if normalized_country not in {"", "all"} and marker.get("country", "").lower() != normalized_country:
             continue
         if normalized_level not in {"", "all", "unknown"} and marker.get("threat_level") != normalized_level:
             continue
