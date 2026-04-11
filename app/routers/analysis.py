@@ -444,9 +444,14 @@ def analyze_message(
 # ----------------------
 @router.get("/history")
 def get_history(db: Session = Depends(get_db), current_user: User = Depends(get_current_user), limit: int = 50):
-    analyses = db.query(EmailAnalysis).filter(
-        EmailAnalysis.user_id == current_user.id
-    ).order_by(desc(EmailAnalysis.created_at)).limit(limit).all()
+    analyses = (
+        db.query(EmailAnalysis)
+        .filter(EmailAnalysis.user_id == current_user.id)
+        .filter(EmailAnalysis.threat_level.in_(["suspicious", "threat", "dangerous"]))
+        .order_by(desc(EmailAnalysis.created_at))
+        .limit(limit)
+        .all()
+    )
     return [
         {
             "id": a.id,
