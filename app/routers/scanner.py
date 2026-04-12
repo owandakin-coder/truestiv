@@ -12,10 +12,166 @@ import ipaddress
 import secrets
 import os
 import requests
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 router = APIRouter()
 DOMAIN_INPUT_PATTERN = re.compile(r"^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,24}$", re.IGNORECASE)
+BRAND_IMPERSONATION_CATALOG = [
+    {"brand": "Microsoft", "tokens": ["microsoft", "office", "outlook", "live"]},
+    {"brand": "Google", "tokens": ["google", "gmail", "googledrive"]},
+    {"brand": "Apple", "tokens": ["apple", "icloud", "itunes"]},
+    {"brand": "Amazon", "tokens": ["amazon", "aws"]},
+    {"brand": "PayPal", "tokens": ["paypal"]},
+    {"brand": "Meta", "tokens": ["facebook", "instagram", "whatsapp", "meta"]},
+    {"brand": "Bank of America", "tokens": ["bankofamerica", "bofa"]},
+    {"brand": "Chase", "tokens": ["chase", "jpmorgan"]},
+    {"brand": "Netflix", "tokens": ["netflix"]},
+    {"brand": "DHL", "tokens": ["dhl"]},
+]
+SUSPICIOUS_DOMAIN_TERMS = {
+    "login", "secure", "verify", "verification", "support", "billing",
+    "update", "account", "payment", "wallet", "reset", "auth", "signin",
+}
+SUSPICIOUS_TLDS = {"xyz", "top", "click", "shop", "gq", "cf", "ml", "ga", "tk"}
+
+
+def _extract_domain_candidate(value: str) -> str:
+    candidate = (value or "").strip().lower()
+    if not candidate:
+        return ""
+    if "://" in candidate:
+        candidate = urlparse(candidate).netloc or candidate
+    candidate = candidate.split("/")[0].split(":")[0].strip(".")
+    return candidate
+
+
+def _compact_domain_label(value: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", (value or "").lower())
+
+
+def _normalize_lookalike_text(value: str) -> str:
+    normalized = _compact_domain_label(value)
+    replacements = (
+        ("rn", "m"),
+        ("vv", "w"),
+        ("0", "o"),
+        ("1", "l"),
+        ("3", "e"),
+        ("4", "a"),
+        ("5", "s"),
+        ("7", "t"),
+        ("8", "b"),
+        ("9", "g"),
+        ("@", "a"),
+        ("$", "s"),
+    )
+    for source, target in replacements:
+        normalized = normalized.replace(source, target)
+    return normalized
+
+
+def _edit_distance(left: str, right: str) -> int:
+    if left == right:
+        return 0
+    if not left:
+        return len(right)
+    if not right:
+        return len(left)
+    previous = list(range(len(right) + 1))
+    for left_index, left_char in enumerate(left, start=1):
+        current = [left_index]
+        for right_index, right_char in enumerate(right, start=1):
+            substitution = previous[right_index - 1] + (0 if left_char == right_char else 1)
+            current.append(min(
+                previous[right_index] + 1,
+                current[right_index - 1] + 1,
+                substitution,
+            ))
+        previous = current
+    return previous[-1]
+
+
+def detect_brand_impersonation(value: str, age_days: int | None = None) -> dict:
+    domain = _extract_domain_candidate(value)
+    if not domain or "." not in domain:
+        return {"active": False, "score": 0, "threat_level": "safe", "reasons": []}
+
+    labels = domain.split(".")
+    if len(labels) < 2:
+        return {"active": False, "score": 0, "threat_level": "safe", "reasons": []}
+
+    root_label = labels[-2]
+    compact_label = _compact_domain_label(root_label)
+    normalized_label = _normalize_lookalike_text(root_label)
+    tld = labels[-1]
+    reasons = []
+    suspicious_terms = [term for term in SUSPICIOUS_DOMAIN_TERMS if term in compact_label]
+    best_match = None
+
+    for entry in BRAND_IMPERSONATION_CATALOG:
+        for token in entry["tokens"]:
+            brand_token = _compact_domain_label(token)
+            exact = compact_label == brand_token
+            normalized_exact = normalized_label == brand_token and compact_label != brand_token
+            contains_brand = brand_token in compact_label and compact_label != brand_token
+            distance = _edit_distance(normalized_label, brand_token)
+            lookalike = distance <= 1 and compact_label != brand_token
+            if exact and not suspicious_terms:
+                continue
+            score = 0
+            local_reasons = []
+            if normalized_exact:
+                score += 48
+                local_reasons.append(f"Character substitution makes the label look like {entry['brand']}.")
+            elif lookalike:
+                score += 40
+                local_reasons.append(f"Domain label is one edit away from {entry['brand']}.")
+            if contains_brand:
+                score += 26
+                local_reasons.append(f"Brand token for {entry['brand']} appears inside the domain label.")
+            if suspicious_terms:
+                score += min(24, 8 * len(suspicious_terms))
+                local_reasons.append(f"Suspicious lure terms detected: {', '.join(sorted(suspicious_terms))}.")
+            if tld in SUSPICIOUS_TLDS:
+                score += 12
+                local_reasons.append(f"Suspicious TLD detected: .{tld}.")
+            if age_days is not None and age_days <= 30:
+                score += 10
+                local_reasons.append("Domain age is very new for a branded service.")
+            if score <= 0:
+                continue
+            candidate = {
+                "active": score >= 35,
+                "brand": entry["brand"],
+                "score": min(100, score),
+                "threat_level": "threat" if score >= 70 else ("suspicious" if score >= 35 else "safe"),
+                "reasons": local_reasons,
+                "suspicious_terms": sorted(suspicious_terms),
+                "matched_label": root_label,
+                "domain": domain,
+            }
+            if not best_match or candidate["score"] > best_match["score"]:
+                best_match = candidate
+
+    if not best_match:
+        return {
+            "active": False,
+            "score": 0,
+            "threat_level": "safe",
+            "domain": domain,
+            "reasons": [],
+            "suspicious_terms": sorted(suspicious_terms),
+        }
+
+    summary = (
+        f"{best_match['domain']} may be impersonating {best_match['brand']}."
+        if best_match["active"]
+        else f"{best_match['domain']} shares some naming traits with {best_match['brand']}."
+    )
+    return {
+        **best_match,
+        "summary": summary,
+    }
 
 
 def get_virustotal_api_key() -> str:
@@ -151,6 +307,10 @@ def analyze_domain_payload(domain: str) -> dict:
 
     intel = aggregate_url_intel(f"https://{candidate}")
     risk_score = int(intel.get("aggregated_score") or intel.get("risk_score") or 0)
+    brand_impersonation = detect_brand_impersonation(candidate)
+    if brand_impersonation.get("active"):
+        risk_score = min(100, max(risk_score, int(brand_impersonation.get("score", 0))))
+
     return {
         "success": True,
         "domain": candidate,
@@ -160,6 +320,7 @@ def analyze_domain_payload(domain: str) -> dict:
         "recommendation": intel.get("recommendation") or "allow",
         "summary": intel.get("summary") or "Domain enrichment completed.",
         "sources": intel.get("sources") or [],
+        "brand_impersonation": brand_impersonation,
     }
 
 
@@ -224,8 +385,11 @@ def analyze_url(data: dict, db: Session = Depends(get_db), current_user: User = 
             indicators.append(f"Suspicious pattern detected: {pattern}")
             risk_score += 15
 
+    domain = ""
+    brand_impersonation = None
     try:
         domain = re.findall(r'://([^/]+)', url)[0].lower()
+        brand_impersonation = detect_brand_impersonation(domain)
         if domain in MALICIOUS_DOMAINS:
             indicators.append(f"Known malicious domain: {domain}")
             risk_score += 60
@@ -233,6 +397,13 @@ def analyze_url(data: dict, db: Session = Depends(get_db), current_user: User = 
         if any(c in domain for c in ['0', '1', 'rn', 'vv']):
             indicators.append("Possible homograph attack")
             risk_score += 20
+
+        if brand_impersonation.get("active"):
+            indicators.append(
+                f"Possible brand impersonation detected: {brand_impersonation.get('brand', 'known brand')}"
+            )
+            indicators.extend(brand_impersonation.get("reasons", [])[:2])
+            risk_score = max(risk_score, int(brand_impersonation.get("score", 0)))
 
         parts = domain.split('.')
         if len(parts) > 4:
@@ -275,12 +446,14 @@ def analyze_url(data: dict, db: Session = Depends(get_db), current_user: User = 
     response = {
         "success": True,
         "url": url,
+        "domain": _extract_domain_candidate(domain or url),
         "threat_level": threat_level,
         "risk_score": risk_score,
         "confidence": min(95, risk_score + 20) if risk_score > 0 else 85,
         "indicators": indicators,
         "recommendation": recommendation,
-        "summary": summary
+        "summary": summary,
+        "brand_impersonation": brand_impersonation
     }
     try:
         persist_scan_history(db, current_user.id, "url", url, response, source="scanner_url")

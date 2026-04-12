@@ -24,6 +24,7 @@ from app.models.models import (
 import requests
 
 from app.services.threat_intel import aggregate_ip_intel, aggregate_url_intel, collect_all_intel, get_ip_geo
+from app.routers.scanner import detect_brand_impersonation
 
 try:
     import dns.resolver as dns_resolver
@@ -1228,6 +1229,7 @@ def domain_lookup(
     ][:12]
 
     age_days = rdap.get("age_days")
+    brand_impersonation = detect_brand_impersonation(normalized_domain, age_days=age_days)
     related_ip_payload = []
     for ip_value in related_ips[:6]:
         related_ip_payload.append(
@@ -1241,8 +1243,14 @@ def domain_lookup(
     risk_score = int(url_intel.get("aggregated_score") or 0)
     if age_days is not None and age_days <= 30:
         risk_score = min(100, risk_score + 12)
+    if brand_impersonation.get("active"):
+        risk_score = min(100, max(risk_score, int(brand_impersonation.get("score", 0))))
 
     threat_level = url_intel.get("threat_level") or ("suspicious" if risk_score >= 25 else "safe")
+    if brand_impersonation.get("threat_level") == "threat":
+        threat_level = "threat"
+    elif brand_impersonation.get("active") and threat_level == "safe":
+        threat_level = "suspicious"
     actor_tags = _threat_actor_tags(
         normalized_domain,
         " ".join(
@@ -1310,6 +1318,7 @@ def domain_lookup(
                 sum(item["confidence_score"] for item in provider_sources) / max(1, len(provider_sources))
             ) if provider_sources else "moderate",
             "threat_actor_tags": actor_tags,
+            "brand_impersonation": brand_impersonation,
         },
         "dns": dns_records,
         "providers": provider_sources,
@@ -1325,6 +1334,7 @@ def domain_lookup(
             "ioc_details_path": _build_ioc_href("domain", normalized_domain),
             "correlation_path": f"/correlation/domain/{quote(normalized_domain, safe='')}",
         },
+        "brand_impersonation": brand_impersonation,
     }
 
 
