@@ -801,6 +801,14 @@ def ioc_details(
         .all()
     )
 
+    collected_matches = (
+        db.query(IntelIndicator)
+        .filter(IntelIndicator.normalized_indicator == normalized_indicator)
+        .order_by(IntelIndicator.last_seen_at.desc(), IntelIndicator.risk_score.desc())
+        .limit(12)
+        .all()
+    )
+
     observation_matches = []
     geo = None
     if normalized_type == "ip":
@@ -843,6 +851,7 @@ def ioc_details(
     risk_values = [
         *(item.risk_score or 0 for item in scan_matches),
         *(item.risk_score or 0 for item in community_matches),
+        *(item.risk_score or 0 for item in collected_matches),
         *(item.risk_score or 0 for item in media_matches),
         *(item.risk_score or 0 for item in observation_matches),
     ]
@@ -852,6 +861,8 @@ def ioc_details(
         latest_candidates.append((scan_matches[0].created_at, _normalize_level(scan_matches[0].threat_level)))
     if community_matches:
         latest_candidates.append((community_matches[0].published_at, _normalize_level(community_matches[0].threat_level)))
+    if collected_matches:
+        latest_candidates.append((collected_matches[0].last_seen_at, _normalize_level(collected_matches[0].threat_level)))
     if media_matches:
         latest_candidates.append((media_matches[0].created_at, _normalize_level(media_matches[0].threat_level)))
     if analysis_matches:
@@ -864,10 +875,24 @@ def ioc_details(
     source_breakdown = {
         "scan_history": len(scan_matches),
         "community": len(community_matches),
+        "collected_intel": len(collected_matches),
         "analyses": len(analysis_matches),
         "media": len(media_matches),
         "observations": len(observation_matches),
     }
+
+    confidence_values = [
+        *[_source_confidence(item.source) for item in scan_matches],
+        *[
+            _source_confidence(item.raw_intel.get("source") if isinstance(item.raw_intel, dict) else "community")
+            for item in community_matches
+        ],
+        *[float(item.confidence or _source_confidence((item.sources or ["collector"])[0])) for item in collected_matches],
+        *[_source_confidence("analysis") for _ in analysis_matches],
+        *[_source_confidence("media") for _ in media_matches],
+        *[_source_confidence(item.source) for item in observation_matches],
+    ]
+    average_confidence = sum(confidence_values) / max(1, len(confidence_values))
 
     return {
         "success": True,
@@ -877,61 +902,15 @@ def ioc_details(
             "normalized_indicator": normalized_indicator,
             "latest_threat_level": latest_level,
             "average_risk_score": round(sum(risk_values) / len(risk_values), 1) if risk_values else 0,
-            "source_confidence": round(
-                (
-                    sum(
-                        [
-                            *[_source_confidence(item.source) for item in scan_matches],
-                            *[
-                                _source_confidence(item.raw_intel.get("source") if isinstance(item.raw_intel, dict) else "community")
-                                for item in community_matches
-                            ],
-                            *[_source_confidence("analysis") for _ in analysis_matches],
-                            *[_source_confidence("media") for _ in media_matches],
-                            *[_source_confidence(item.source) for item in observation_matches],
-                        ]
-                    )
-                    / max(
-                        1,
-                        len(scan_matches)
-                        + len(community_matches)
-                        + len(analysis_matches)
-                        + len(media_matches)
-                        + len(observation_matches),
-                    )
-                ),
-                2,
-            ),
-            "source_confidence_label": _confidence_label(
-                (
-                    sum(
-                        [
-                            *[_source_confidence(item.source) for item in scan_matches],
-                            *[
-                                _source_confidence(item.raw_intel.get("source") if isinstance(item.raw_intel, dict) else "community")
-                                for item in community_matches
-                            ],
-                            *[_source_confidence("analysis") for _ in analysis_matches],
-                            *[_source_confidence("media") for _ in media_matches],
-                            *[_source_confidence(item.source) for item in observation_matches],
-                        ]
-                    )
-                    / max(
-                        1,
-                        len(scan_matches)
-                        + len(community_matches)
-                        + len(analysis_matches)
-                        + len(media_matches)
-                        + len(observation_matches),
-                    )
-                )
-            ),
+            "source_confidence": round(average_confidence, 2),
+            "source_confidence_label": _confidence_label(average_confidence),
             "threat_actor_tags": _threat_actor_tags(
                 indicator,
                 " ".join(
                     [
                         *[item.summary or "" for item in scan_matches],
                         *[(item.description or item.title or "") for item in community_matches],
+                        *[item.summary or "" for item in collected_matches],
                         *[item.summary or "" for item in analysis_matches],
                         *[item.summary or "" for item in media_matches],
                     ]
@@ -943,6 +922,7 @@ def ioc_details(
                             (item.raw_intel.get("source") if isinstance(item.raw_intel, dict) else "community")
                             for item in community_matches
                         ],
+                        *[" ".join(item.sources or ["collector"]) for item in collected_matches],
                     ]
                 ),
                 normalized_type,
@@ -962,6 +942,22 @@ def ioc_details(
                 "published_at": _iso(item.published_at),
             }
             for item in community_matches
+        ],
+        "collected_signals": [
+            {
+                "id": item.id,
+                "indicator_type": item.indicator_type,
+                "indicator": item.indicator,
+                "summary": item.summary or "Collected by the Trustive intelligence pipeline.",
+                "risk_score": item.risk_score or 0,
+                "threat_level": _normalize_level(item.threat_level),
+                "confidence": float(item.confidence or _source_confidence((item.sources or ["collector"])[0])),
+                "sources": item.sources or [],
+                "first_seen_at": _iso(item.first_seen_at),
+                "last_seen_at": _iso(item.last_seen_at),
+                "details_path": _build_ioc_href(item.indicator_type, item.indicator),
+            }
+            for item in collected_matches
         ],
         "analyses": [
             {
@@ -1087,6 +1083,17 @@ def ip_lookup(
                 "threat_level": item.get("threat_level"),
                 "created_at": item.get("published_at"),
                 "path": _build_ioc_href("ip", item.get("indicator") or normalized_ip),
+            }
+        )
+    for item in dossier.get("collected_signals", [])[:8]:
+        recent_events.append(
+            {
+                "event_type": "collection",
+                "title": item.get("indicator") or "Collected signal",
+                "summary": item.get("summary") or "Captured by the collection pipeline.",
+                "threat_level": item.get("threat_level"),
+                "created_at": item.get("last_seen_at") or item.get("first_seen_at"),
+                "path": item.get("details_path") or _build_ioc_href("ip", normalized_ip),
             }
         )
     for item in dossier["analyses"][:6]:
@@ -1252,6 +1259,20 @@ def domain_lookup(
         )
     ][:12]
 
+    collected_matches = (
+        db.query(IntelIndicator)
+        .filter(IntelIndicator.indicator_type.in_(["domain", "url"]))
+        .order_by(IntelIndicator.last_seen_at.desc(), IntelIndicator.risk_score.desc())
+        .limit(160)
+        .all()
+    )
+    matching_collected = [
+        item
+        for item in collected_matches
+        if normalized_domain in _normalize_indicator(item.indicator_type, item.indicator)
+        or normalized_domain in str(item.summary or "").lower()
+    ][:18]
+
     age_days = rdap.get("age_days")
     brand_impersonation = detect_brand_impersonation(normalized_domain, age_days=age_days)
     related_ip_payload = []
@@ -1267,6 +1288,14 @@ def domain_lookup(
     risk_score = int(url_intel.get("aggregated_score") or 0)
     if age_days is not None and age_days <= 30:
         risk_score = min(100, risk_score + 12)
+    if matching_collected:
+        risk_score = min(
+            100,
+            max(
+                risk_score,
+                max(int(item.risk_score or 0) for item in matching_collected),
+            ),
+        )
     if brand_impersonation.get("active"):
         risk_score = min(100, max(risk_score, int(brand_impersonation.get("score", 0))))
 
@@ -1282,9 +1311,12 @@ def domain_lookup(
                 str(item.summary or "") for item in matching_scans
             ]
             + [str(item.description or item.title or "") for item in community_matches]
+            + [str(item.summary or "") for item in matching_collected]
             + [str(item.summary or "") for item in matching_analyses]
         ),
-        " ".join(provider.get("source", "") for provider in provider_sources),
+        " ".join(provider.get("source", "") for provider in provider_sources)
+        + " "
+        + " ".join(" ".join(item.sources or []) for item in matching_collected),
         "domain",
     )
 
@@ -1311,6 +1343,17 @@ def domain_lookup(
                 "path": _build_ioc_href(item.threat_type, item.indicator),
             }
         )
+    for item in matching_collected[:8]:
+        recent_events.append(
+            {
+                "event_type": "collection",
+                "title": item.indicator,
+                "summary": item.summary or "Domain collected by the intelligence pipeline.",
+                "threat_level": _normalize_level(item.threat_level),
+                "created_at": _iso(item.last_seen_at or item.first_seen_at),
+                "path": _build_ioc_href(item.indicator_type, item.indicator),
+            }
+        )
     for item in matching_analyses[:6]:
         recent_events.append(
             {
@@ -1335,12 +1378,20 @@ def domain_lookup(
             "recommendation": url_intel.get("recommendation") or ("quarantine" if risk_score >= 25 else "allow"),
             "source_count": len(provider_sources),
             "source_confidence": round(
-                sum(item["confidence_score"] for item in provider_sources) / max(1, len(provider_sources)),
+                (
+                    sum(item["confidence_score"] for item in provider_sources)
+                    + sum(float(item.confidence or _source_confidence((item.sources or ["collector"])[0])) for item in matching_collected)
+                )
+                / max(1, len(provider_sources) + len(matching_collected)),
                 2,
-            ) if provider_sources else 0.6,
+            ) if (provider_sources or matching_collected) else 0.6,
             "source_confidence_label": _confidence_label(
-                sum(item["confidence_score"] for item in provider_sources) / max(1, len(provider_sources))
-            ) if provider_sources else "moderate",
+                (
+                    sum(item["confidence_score"] for item in provider_sources)
+                    + sum(float(item.confidence or _source_confidence((item.sources or ["collector"])[0])) for item in matching_collected)
+                )
+                / max(1, len(provider_sources) + len(matching_collected))
+            ) if (provider_sources or matching_collected) else "moderate",
             "threat_actor_tags": actor_tags,
             "brand_impersonation": brand_impersonation,
         },
@@ -1350,8 +1401,9 @@ def domain_lookup(
         "sightings": {
             "scan_history": len(matching_scans),
             "community": len(community_matches),
+            "collected_intel": len(matching_collected),
             "analyses": len(matching_analyses),
-            "total": len(matching_scans) + len(community_matches) + len(matching_analyses),
+            "total": len(matching_scans) + len(community_matches) + len(matching_collected) + len(matching_analyses),
         },
         "recent_events": _sorted_recent_events(recent_events)[:16],
         "pivots": {
