@@ -157,6 +157,30 @@ def run_retry_threat_intel():
     return run_logged_job("retry-threat-intel", retry_failed_intel_sources)
 
 
+def should_run_initial_collection(cooldown_hours: int = 4) -> bool:
+    db = SessionLocal()
+    try:
+        latest_success = (
+            db.query(BackgroundJobRun)
+            .filter(
+                BackgroundJobRun.job_name == "collect-threat-intel",
+                BackgroundJobRun.status == "success",
+            )
+            .order_by(BackgroundJobRun.finished_at.desc(), BackgroundJobRun.started_at.desc())
+            .first()
+        )
+        if not latest_success:
+            return True
+
+        reference_time = latest_success.finished_at or latest_success.started_at
+        if not reference_time:
+            return True
+
+        return reference_time < datetime.utcnow() - timedelta(hours=cooldown_hours)
+    finally:
+        db.close()
+
+
 @app.on_event("startup")
 def startup_event():
     ensure_database_schema()
@@ -171,6 +195,14 @@ def startup_event():
 
     if not hasattr(app.state, "scheduler"):
         scheduler = BackgroundScheduler()
+        if should_run_initial_collection():
+            scheduler.add_job(
+                run_collect_threat_intel,
+                "date",
+                run_date=datetime.utcnow() + timedelta(seconds=10),
+                id="bootstrap-collect-threat-intel",
+                replace_existing=True,
+            )
         scheduler.add_job(
             run_collect_threat_intel,
             "interval",
