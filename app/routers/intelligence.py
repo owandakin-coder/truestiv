@@ -392,6 +392,44 @@ def _collect_geo_markers(db: Session) -> list[dict]:
             }
         )
 
+    for item in (
+        db.query(IntelIndicator)
+        .filter(
+            IntelIndicator.indicator_type == "ip",
+            IntelIndicator.threat_level.in_(["suspicious", "threat"]),
+        )
+        .order_by(IntelIndicator.last_seen_at.desc(), IntelIndicator.risk_score.desc())
+        .limit(180)
+        .all()
+    ):
+        ip = (item.indicator or "").strip()
+        if not ip or ip in seen or not IP_PATTERN.match(ip):
+            continue
+        geo = get_ip_geo(ip)
+        if geo.get("lat") is None or geo.get("lon") is None:
+            continue
+        seen.add(ip)
+        primary_source = (item.sources or ["collector"])[0]
+        markers.append(
+            {
+                "indicator": ip,
+                "ioc_type": "ip",
+                "latitude": geo.get("lat"),
+                "longitude": geo.get("lon"),
+                "country": geo.get("country") or "Unknown",
+                "city": geo.get("city") or "",
+                "region": geo.get("region") or "",
+                "organization": geo.get("org") or "",
+                "isp": geo.get("isp") or "",
+                "risk_score": item.risk_score or 0,
+                "threat_level": _normalize_level(item.threat_level),
+                "published_at": _iso(item.last_seen_at or item.last_collected_at or item.first_seen_at) or datetime.utcnow().isoformat(),
+                "location_name": ", ".join(part for part in [geo.get("city"), geo.get("country")] if part) or "Unknown location",
+                "source": primary_source,
+                "details_path": _build_ioc_href("ip", ip),
+            }
+        )
+
     return markers
 
 
@@ -455,6 +493,29 @@ def _build_community_event(item: CommunityThreat) -> dict:
         "actor_tags": _threat_actor_tags(item.indicator, summary, intel_source or "community", item.threat_type),
         "created_at": _iso(item.published_at),
         "details_path": _build_ioc_href(item.threat_type, item.indicator),
+    }
+
+
+def _build_intel_indicator_event(item: IntelIndicator) -> dict:
+    sources = item.sources or []
+    primary_source = sources[0] if sources else "collector"
+    summary = item.summary or "A collected intelligence indicator is available."
+    confidence_score = float(item.confidence or _source_confidence(primary_source))
+    return {
+        "id": f"intel-indicator-{item.id}",
+        "event_type": "intel_collection",
+        "source": primary_source,
+        "ioc_type": item.indicator_type,
+        "indicator": item.indicator,
+        "title": f"{str(item.indicator_type or 'indicator').upper()} collected from feeds",
+        "summary": summary,
+        "threat_level": _normalize_level(item.threat_level),
+        "risk_score": item.risk_score or 0,
+        "source_confidence": confidence_score,
+        "source_confidence_label": _confidence_label(confidence_score),
+        "actor_tags": _threat_actor_tags(item.indicator, summary, primary_source, item.indicator_type),
+        "created_at": _iso(item.last_seen_at or item.last_collected_at or item.first_seen_at),
+        "details_path": _build_ioc_href(item.indicator_type, item.indicator),
     }
 
 
@@ -656,46 +717,7 @@ def timeline(
     normalized_source = (source or "").strip().lower()
     normalized_level = _normalize_level(threat_level)
 
-    events = []
-
-    for item in (
-        db.query(ScanHistory)
-        .filter(ScanHistory.user_id == current_user.id)
-        .filter(ScanHistory.threat_level.in_(["suspicious", "threat", "dangerous"]))
-        .order_by(ScanHistory.created_at.desc())
-        .limit(limit)
-        .all()
-    ):
-        events.append(_build_scan_event(item))
-
-    for item in (
-        db.query(CommunityThreat)
-        .filter(CommunityThreat.threat_level.in_(["suspicious", "threat", "dangerous"]))
-        .order_by(CommunityThreat.published_at.desc())
-        .limit(limit)
-        .all()
-    ):
-        events.append(_build_community_event(item))
-
-    for item in (
-        db.query(EmailAnalysis)
-        .filter(EmailAnalysis.user_id == current_user.id)
-        .filter(EmailAnalysis.threat_level.in_(["suspicious", "threat", "dangerous"]))
-        .order_by(EmailAnalysis.created_at.desc())
-        .limit(limit)
-        .all()
-    ):
-        events.append(_build_analysis_event(item))
-
-    for item in (
-        db.query(MediaAnalysis)
-        .filter(MediaAnalysis.user_id == current_user.id)
-        .filter(MediaAnalysis.threat_level.in_(["suspicious", "threat", "dangerous"]))
-        .order_by(MediaAnalysis.created_at.desc())
-        .limit(limit)
-        .all()
-    ):
-        events.append(_build_media_event(item))
+    events = _collect_recent_signal_events(db, current_user, limit=limit, include_private=True)
 
     filtered = []
     for event in events:
@@ -1839,6 +1861,15 @@ def _collect_recent_signal_events(
         .all()
     ):
         events.append(_build_community_event(item))
+
+    for item in (
+        db.query(IntelIndicator)
+        .filter(IntelIndicator.threat_level.in_(["suspicious", "threat"]))
+        .order_by(IntelIndicator.last_seen_at.desc(), IntelIndicator.risk_score.desc())
+        .limit(limit)
+        .all()
+    ):
+        events.append(_build_intel_indicator_event(item))
 
     if include_private:
         for item in (
