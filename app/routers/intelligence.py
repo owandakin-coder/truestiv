@@ -1740,6 +1740,20 @@ def search_intelligence(
         .all()
     )
 
+    collected = (
+        db.query(IntelIndicator)
+        .filter(
+            IntelIndicator.threat_level.in_(["suspicious", "threat", "dangerous"]),
+            (
+                IntelIndicator.indicator.ilike(pattern)
+                | IntelIndicator.summary.ilike(pattern)
+            ),
+        )
+        .order_by(IntelIndicator.last_seen_at.desc(), IntelIndicator.risk_score.desc())
+        .limit(limit)
+        .all()
+    )
+
     items = [
         *[
             {
@@ -1788,6 +1802,18 @@ def search_intelligence(
                 "details_path": "",
             }
             for item in media
+        ],
+        *[
+            {
+                "id": f"collection-{item.id}",
+                "kind": "collection",
+                "title": item.indicator,
+                "summary": item.summary or "Captured by the Trustive collection pipeline.",
+                "threat_level": _normalize_level(item.threat_level),
+                "created_at": _iso(item.last_seen_at or item.first_seen_at),
+                "details_path": _build_ioc_href(item.indicator_type, item.indicator),
+            }
+            for item in collected
         ],
     ]
     items = _dedupe_events(
