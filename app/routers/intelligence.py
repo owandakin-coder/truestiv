@@ -13,10 +13,12 @@ from app.core.config import settings
 from app.core.database import get_db
 from app.models.models import (
     BackgroundJobRun,
+    CollectedIntelItem,
     CommunityThreat,
     EmailAnalysis,
     EnrichmentRetryTask,
     IPScanObservation,
+    IntelIndicator,
     MediaAnalysis,
     ScanHistory,
     User,
@@ -2082,6 +2084,136 @@ def campaign_clusters(
     if selected is None and items:
         selected = items[0]
     return {"success": True, "items": items, "selected": selected}
+
+
+@router.get("/collection/overview")
+def collection_overview(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    latest_runs = (
+        db.query(BackgroundJobRun)
+        .filter(BackgroundJobRun.job_name.in_(["collect-threat-intel", "retry-threat-intel"]))
+        .order_by(BackgroundJobRun.started_at.desc())
+        .limit(8)
+        .all()
+    )
+    raw_total = db.query(CollectedIntelItem).count()
+    indicator_total = db.query(IntelIndicator).count()
+    actionable_total = (
+        db.query(IntelIndicator)
+        .filter(IntelIndicator.threat_level.in_(["suspicious", "threat"]))
+        .count()
+    )
+    source_breakdown = {}
+    for item in db.query(CollectedIntelItem.source).all():
+        source_name = item[0] or "unknown"
+        source_breakdown[source_name] = source_breakdown.get(source_name, 0) + 1
+
+    latest_run = latest_runs[0] if latest_runs else None
+    return {
+        "success": True,
+        "summary": {
+            "raw_items": raw_total,
+            "indicators": indicator_total,
+            "actionable_indicators": actionable_total,
+            "sources": len(source_breakdown),
+            "latest_collection_at": _iso(latest_run.started_at) if latest_run else None,
+        },
+        "latest_runs": [
+            {
+                "job_name": item.job_name,
+                "status": item.status,
+                "message": item.message,
+                "stats": item.stats or {},
+                "started_at": _iso(item.started_at),
+                "finished_at": _iso(item.finished_at),
+            }
+            for item in latest_runs
+        ],
+        "source_breakdown": [
+            {"source": source, "count": count, "confidence_score": _source_confidence(source)}
+            for source, count in sorted(source_breakdown.items(), key=lambda pair: pair[1], reverse=True)
+        ],
+    }
+
+
+@router.get("/collection/items")
+def collection_items(
+    source: str | None = None,
+    indicator_type: str | None = None,
+    limit: int = Query(default=40, ge=1, le=200),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    query = db.query(CollectedIntelItem).order_by(CollectedIntelItem.collected_at.desc())
+    if source:
+        query = query.filter(CollectedIntelItem.source == source)
+    if indicator_type:
+        query = query.filter(CollectedIntelItem.indicator_type == indicator_type)
+
+    items = query.limit(limit).all()
+    return {
+        "success": True,
+        "items": [
+            {
+                "id": item.id,
+                "source": item.source,
+                "indicator_type": item.indicator_type,
+                "indicator": item.indicator,
+                "threat_level": item.threat_level,
+                "risk_score": item.risk_score,
+                "summary": item.summary,
+                "published_at": _iso(item.published_at),
+                "collected_at": _iso(item.collected_at),
+                "collection_batch": item.collection_batch,
+                "job_name": item.job_name,
+                "raw_intel": item.raw_intel or {},
+            }
+            for item in items
+        ],
+    }
+
+
+@router.get("/collection/indicators")
+def collection_indicators(
+    threat_level: str | None = None,
+    indicator_type: str | None = None,
+    limit: int = Query(default=50, ge=1, le=200),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    query = db.query(IntelIndicator).order_by(
+        IntelIndicator.risk_score.desc(),
+        IntelIndicator.last_seen_at.desc(),
+    )
+    if threat_level:
+        query = query.filter(IntelIndicator.threat_level == _normalize_level(threat_level))
+    if indicator_type:
+        query = query.filter(IntelIndicator.indicator_type == indicator_type)
+
+    items = query.limit(limit).all()
+    return {
+        "success": True,
+        "items": [
+            {
+                "id": item.id,
+                "indicator_type": item.indicator_type,
+                "indicator": item.indicator,
+                "threat_level": item.threat_level,
+                "risk_score": item.risk_score,
+                "confidence": item.confidence,
+                "source_count": item.source_count,
+                "sources": item.sources or [],
+                "sightings": item.sightings or 0,
+                "summary": item.summary,
+                "first_seen_at": _iso(item.first_seen_at),
+                "last_seen_at": _iso(item.last_seen_at),
+                "last_collected_at": _iso(item.last_collected_at),
+            }
+            for item in items
+        ],
+    }
 
 
 @router.get("/jobs/status")

@@ -8,7 +8,12 @@ from typing import Dict, Any, List
 from tenacity import retry, stop_after_attempt, wait_exponential
 from app.core.config import settings
 from app.core.database import SessionLocal
-from app.models.models import CommunityThreat, EnrichmentRetryTask
+from app.models.models import (
+    CollectedIntelItem,
+    CommunityThreat,
+    EnrichmentRetryTask,
+    IntelIndicator,
+)
 
 # Attempt Redis import gracefully
 try:
@@ -28,6 +33,14 @@ GREYNOISE_KEY = settings.GREYNOISE_API_KEY
 OTX_KEY = getattr(settings, "OTX_API_KEY", "")
 logger = logging.getLogger(__name__)
 FAILED_SOURCES_CACHE_KEY = "trustive:intel:failed_sources"
+SOURCE_CONFIDENCE = {
+    "alienvault otx": 0.72,
+    "urlhaus": 0.92,
+    "abuseipdb": 0.88,
+    "phishtank": 0.9,
+    "ibm x-force": 0.8,
+    "cisa kev": 0.96,
+}
 
 # Redis connection (if available)
 redis_client = None
@@ -584,6 +597,14 @@ def _resolve_threat_level(risk_score: int) -> str:
     return "safe"
 
 
+def _source_confidence(source: str | None) -> float:
+    return SOURCE_CONFIDENCE.get((source or "").strip().lower(), 0.65)
+
+
+def _utcnow() -> datetime:
+    return datetime.utcnow()
+
+
 def _append_threat(
     threats: List[Dict[str, Any]],
     indicator: str | None,
@@ -876,6 +897,141 @@ def fetch_cisa_kev_recent() -> List[Dict[str, Any]]:
     return threats
 
 
+def store_collected_intel(threats: List[Dict[str, Any]], job_name: str = "collect-threat-intel") -> Dict[str, Any]:
+    if not threats:
+        return {"batch_id": None, "raw_saved": 0, "indicators_upserted": 0}
+
+    db = SessionLocal()
+    batch_id = f"{job_name}:{int(_utcnow().timestamp())}"
+    raw_saved = 0
+    indicators_upserted = 0
+
+    try:
+        existing_indicator_map = {
+            (item.indicator_type, item.normalized_indicator): item
+            for item in db.query(IntelIndicator).all()
+        }
+
+        aggregated: Dict[tuple[str, str], dict] = {}
+        for threat in threats:
+            normalized_indicator = _normalize_indicator(threat.get("indicator"))
+            if not normalized_indicator:
+                continue
+
+            indicator_type = str(threat.get("threat_type") or "unknown").lower()
+            risk_score = max(0, min(100, int(threat.get("risk_score", 0) or 0)))
+            published_at = (
+                threat.get("published_at")
+                if isinstance(threat.get("published_at"), datetime)
+                else _parse_datetime(threat.get("published_at"))
+            )
+            source = threat.get("source") or "Threat intelligence feed"
+            summary = threat.get("summary") or f"Collected from {source}"
+
+            db.add(
+                CollectedIntelItem(
+                    source=source,
+                    indicator_type=indicator_type,
+                    indicator=normalized_indicator,
+                    normalized_indicator=normalized_indicator.lower(),
+                    threat_level=_resolve_threat_level(risk_score),
+                    risk_score=risk_score,
+                    summary=summary,
+                    published_at=published_at,
+                    collection_batch=batch_id,
+                    job_name=job_name,
+                    raw_intel=threat.get("raw_intel", {}) or {},
+                )
+            )
+            raw_saved += 1
+
+            key = (indicator_type, normalized_indicator.lower())
+            item = aggregated.setdefault(
+                key,
+                {
+                    "indicator": normalized_indicator,
+                    "indicator_type": indicator_type,
+                    "risk_score": risk_score,
+                    "threat_level": _resolve_threat_level(risk_score),
+                    "summary": summary,
+                    "first_seen_at": published_at,
+                    "last_seen_at": published_at,
+                    "last_collected_at": _utcnow(),
+                    "sources": [],
+                    "latest_raw_intel": threat.get("raw_intel", {}) or {},
+                    "sightings": 0,
+                },
+            )
+            item["risk_score"] = max(item["risk_score"], risk_score)
+            item["threat_level"] = _resolve_threat_level(item["risk_score"])
+            item["summary"] = summary if risk_score >= item["risk_score"] else item["summary"]
+            item["first_seen_at"] = min(item["first_seen_at"], published_at)
+            item["last_seen_at"] = max(item["last_seen_at"], published_at)
+            item["last_collected_at"] = _utcnow()
+            item["latest_raw_intel"] = threat.get("raw_intel", {}) or item["latest_raw_intel"]
+            item["sightings"] += 1
+            if source not in item["sources"]:
+                item["sources"].append(source)
+
+        for (indicator_type, normalized_indicator), item in aggregated.items():
+            existing = existing_indicator_map.get((indicator_type, normalized_indicator))
+            sources = sorted(item["sources"])
+            confidence = round(
+                sum(_source_confidence(source_name) for source_name in sources) / max(1, len(sources)),
+                2,
+            )
+            if existing:
+                existing.indicator = item["indicator"]
+                existing.risk_score = max(existing.risk_score or 0, item["risk_score"])
+                existing.threat_level = _resolve_threat_level(existing.risk_score)
+                existing.summary = item["summary"] or existing.summary
+                existing.last_seen_at = max(existing.last_seen_at or item["last_seen_at"], item["last_seen_at"])
+                existing.last_collected_at = item["last_collected_at"]
+                existing.first_seen_at = min(existing.first_seen_at or item["first_seen_at"], item["first_seen_at"])
+                merged_sources = sorted(set((existing.sources or []) + sources))
+                existing.sources = merged_sources
+                existing.source_count = len(merged_sources)
+                existing.confidence = round(
+                    sum(_source_confidence(source_name) for source_name in merged_sources) / max(1, len(merged_sources)),
+                    2,
+                )
+                existing.sightings = int(existing.sightings or 0) + item["sightings"]
+                existing.latest_raw_intel = item["latest_raw_intel"]
+            else:
+                db.add(
+                    IntelIndicator(
+                        indicator_type=indicator_type,
+                        indicator=item["indicator"],
+                        normalized_indicator=normalized_indicator,
+                        threat_level=item["threat_level"],
+                        risk_score=item["risk_score"],
+                        confidence=confidence,
+                        source_count=len(sources),
+                        first_seen_at=item["first_seen_at"],
+                        last_seen_at=item["last_seen_at"],
+                        last_collected_at=item["last_collected_at"],
+                        sources=sources,
+                        sightings=item["sightings"],
+                        summary=item["summary"],
+                        latest_raw_intel=item["latest_raw_intel"],
+                    )
+                )
+            indicators_upserted += 1
+
+        db.commit()
+        return {
+            "batch_id": batch_id,
+            "raw_saved": raw_saved,
+            "indicators_upserted": indicators_upserted,
+        }
+    except Exception:
+        db.rollback()
+        logger.exception("Failed to store collected intel batch")
+        raise
+    finally:
+        db.close()
+
+
 def save_threats_to_db(threats: List[Dict[str, Any]]) -> int:
     if not threats:
         return 0
@@ -955,28 +1111,41 @@ FETCHERS = {
 }
 
 
-def collect_all_intel() -> Dict[str, int]:
+def collect_all_intel() -> Dict[str, Any]:
     collected_threats: List[Dict[str, Any]] = []
+    source_stats: Dict[str, int] = {}
 
     for fetcher_name, fetcher in FETCHERS.items():
         try:
             fetched = fetcher()
             collected_threats.extend(fetched)
+            source_stats[fetcher_name] = len(fetched)
             _clear_failed_source(fetcher_name)
         except Exception as exc:
             logger.exception("Threat intel fetcher %s failed: %s", fetcher_name, exc)
+            source_stats[fetcher_name] = 0
             _register_failed_source(fetcher_name, str(exc))
 
+    pipeline_stats = store_collected_intel(collected_threats, job_name="collect-threat-intel")
     saved_count = save_threats_to_db(collected_threats)
     logger.info(
-        "Threat intelligence collection finished: collected=%s saved=%s",
+        "Threat intelligence collection finished: collected=%s saved=%s raw_saved=%s indicators_upserted=%s",
         len(collected_threats),
         saved_count,
+        pipeline_stats["raw_saved"],
+        pipeline_stats["indicators_upserted"],
     )
-    return {"collected": len(collected_threats), "saved": saved_count}
+    return {
+        "collected": len(collected_threats),
+        "saved": saved_count,
+        "raw_saved": pipeline_stats["raw_saved"],
+        "indicators_upserted": pipeline_stats["indicators_upserted"],
+        "batch_id": pipeline_stats["batch_id"],
+        "by_source": source_stats,
+    }
 
 
-def retry_failed_intel_sources() -> Dict[str, int]:
+def retry_failed_intel_sources() -> Dict[str, Any]:
     db = SessionLocal()
     retried = 0
     recovered = 0
@@ -1011,10 +1180,14 @@ def retry_failed_intel_sources() -> Dict[str, int]:
             logger.exception("Retry for threat intel source %s failed: %s", task.source, exc)
             _register_failed_source(task.source, str(exc))
 
+    pipeline_stats = store_collected_intel(collected_threats, job_name="retry-threat-intel")
     saved_count = save_threats_to_db(collected_threats)
     return {
         "retried": retried,
         "recovered": recovered,
         "collected": len(collected_threats),
         "saved": saved_count,
+        "raw_saved": pipeline_stats["raw_saved"],
+        "indicators_upserted": pipeline_stats["indicators_upserted"],
+        "batch_id": pipeline_stats["batch_id"],
     }

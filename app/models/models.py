@@ -403,3 +403,45 @@ class BackgroundJobRun(Base):
     stats = Column(JSON, default=dict)
     started_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)
     finished_at = Column(DateTime(timezone=True))
+
+
+class CollectedIntelItem(Base):
+    __tablename__ = "collected_intel_items"
+
+    id = Column(Integer, primary_key=True, index=True)
+    source = Column(String(120), nullable=False, index=True)
+    indicator_type = Column(String(60), nullable=False, index=True)
+    indicator = Column(String(500), nullable=False, index=True)
+    normalized_indicator = Column(String(500), nullable=False, index=True)
+    threat_level = Column(String(20), nullable=False, default="safe", index=True)
+    risk_score = Column(Integer, default=0)
+    summary = Column(Text)
+    published_at = Column(DateTime(timezone=True), index=True)
+    collected_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)
+    collection_batch = Column(String(120), index=True)
+    job_name = Column(String(120), index=True)
+    raw_intel = Column(JSON, default=dict)
+
+
+class IntelIndicator(Base):
+    __tablename__ = "intel_indicators"
+
+    id = Column(Integer, primary_key=True, index=True)
+    indicator_type = Column(String(60), nullable=False, index=True)
+    indicator = Column(String(500), nullable=False, index=True)
+    normalized_indicator = Column(String(500), nullable=False, index=True)
+    threat_level = Column(String(20), nullable=False, default="safe", index=True)
+    risk_score = Column(Integer, default=0)
+    confidence = Column(Float, default=0)
+    source_count = Column(Integer, default=0)
+    first_seen_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)
+    last_seen_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)
+    last_collected_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)
+    sources = Column(JSON, default=list)
+    sightings = Column(Integer, default=1)
+    summary = Column(Text)
+    latest_raw_intel = Column(JSON, default=dict)
+
+    __table_args__ = (
+        UniqueConstraint("indicator_type", "normalized_indicator", name="uq_intel_indicator_type_value"),
+    )
