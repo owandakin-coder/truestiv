@@ -2219,7 +2219,21 @@ def collection_overview(
         source_name = item[0] or "unknown"
         source_breakdown[source_name] = source_breakdown.get(source_name, 0) + 1
 
-    latest_run = latest_runs[0] if latest_runs else None
+    latest_collect_run = next((item for item in latest_runs if item.job_name == "collect-threat-intel"), None)
+    latest_retry_run = next((item for item in latest_runs if item.job_name == "retry-threat-intel"), None)
+
+    def _serialize_job_run(item: BackgroundJobRun | None) -> dict | None:
+        if not item:
+            return None
+        return {
+            "job_name": item.job_name,
+            "status": item.status,
+            "message": item.message,
+            "stats": item.stats or {},
+            "started_at": _iso(item.started_at),
+            "finished_at": _iso(item.finished_at),
+        }
+
     return {
         "success": True,
         "summary": {
@@ -2227,17 +2241,12 @@ def collection_overview(
             "indicators": indicator_total,
             "actionable_indicators": actionable_total,
             "sources": len(source_breakdown),
-            "latest_collection_at": _iso(latest_run.started_at) if latest_run else None,
+            "latest_collection_at": _iso(latest_collect_run.started_at) if latest_collect_run else None,
         },
+        "latest_collect_run": _serialize_job_run(latest_collect_run),
+        "latest_retry_run": _serialize_job_run(latest_retry_run),
         "latest_runs": [
-            {
-                "job_name": item.job_name,
-                "status": item.status,
-                "message": item.message,
-                "stats": item.stats or {},
-                "started_at": _iso(item.started_at),
-                "finished_at": _iso(item.finished_at),
-            }
+            _serialize_job_run(item)
             for item in latest_runs
         ],
         "source_breakdown": [
