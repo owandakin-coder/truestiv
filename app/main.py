@@ -1,5 +1,5 @@
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
@@ -15,6 +15,18 @@ from app.core.billing import seed_plans
 from app.services.threat_intel import collect_all_intel, retry_failed_intel_sources
 
 logger = logging.getLogger(__name__)
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def ensure_utc(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
 
 Base.metadata.create_all(bind=engine)
 
@@ -129,7 +141,7 @@ def run_logged_job(job_name: str, job_callable):
                 stored.status = "success"
                 stored.stats = result if isinstance(result, dict) else {"result": str(result)}
                 stored.message = "Completed successfully"
-                stored.finished_at = datetime.utcnow()
+                stored.finished_at = utc_now()
                 db.commit()
         finally:
             db.close()
@@ -142,7 +154,7 @@ def run_logged_job(job_name: str, job_callable):
             if stored:
                 stored.status = "failed"
                 stored.message = str(exc)
-                stored.finished_at = datetime.utcnow()
+                stored.finished_at = utc_now()
                 db.commit()
         finally:
             db.close()
@@ -172,11 +184,11 @@ def should_run_initial_collection(cooldown_hours: int = 4) -> bool:
         if not latest_success:
             return True
 
-        reference_time = latest_success.finished_at or latest_success.started_at
+        reference_time = ensure_utc(latest_success.finished_at or latest_success.started_at)
         if not reference_time:
             return True
 
-        return reference_time < datetime.utcnow() - timedelta(hours=cooldown_hours)
+        return reference_time < utc_now() - timedelta(hours=cooldown_hours)
     finally:
         db.close()
 
@@ -199,7 +211,7 @@ def startup_event():
             scheduler.add_job(
                 run_collect_threat_intel,
                 "date",
-                run_date=datetime.utcnow() + timedelta(seconds=10),
+                run_date=utc_now() + timedelta(seconds=10),
                 id="bootstrap-collect-threat-intel",
                 replace_existing=True,
             )
