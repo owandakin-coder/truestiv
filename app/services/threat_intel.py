@@ -1,5 +1,7 @@
 import requests
 import base64
+import csv
+import io
 import json
 import logging
 import os
@@ -31,6 +33,8 @@ VIRUSTOTAL_KEY = (
 ABUSEIPDB_KEY = settings.ABUSEIPDB_API_KEY
 GREYNOISE_KEY = settings.GREYNOISE_API_KEY
 OTX_KEY = getattr(settings, "OTX_API_KEY", "")
+URLHAUS_AUTH_KEY = getattr(settings, "URLHAUS_AUTH_KEY", "") or os.getenv("URLHAUS_AUTH_KEY", "")
+PHISHTANK_APP_KEY = getattr(settings, "PHISHTANK_APP_KEY", "") or os.getenv("PHISHTANK_APP_KEY", "")
 logger = logging.getLogger(__name__)
 FAILED_SOURCES_CACHE_KEY = "trustive:intel:failed_sources"
 SOURCE_CONFIDENCE = {
@@ -550,17 +554,17 @@ def aggregate_url_intel(url: str) -> Dict[str, Any]:
 
 def _parse_datetime(value: str | None) -> datetime:
     if not value:
-        return datetime.utcnow()
+        return datetime.now(timezone.utc)
 
     normalized = value.strip()
     if not normalized:
-        return datetime.utcnow()
+        return datetime.now(timezone.utc)
 
     try:
         parsed = datetime.fromisoformat(normalized.replace("Z", "+00:00"))
         if parsed.tzinfo is not None:
-            return parsed.astimezone(timezone.utc).replace(tzinfo=None)
-        return parsed
+            return parsed.astimezone(timezone.utc)
+        return parsed.replace(tzinfo=timezone.utc)
     except ValueError:
         pass
 
@@ -576,13 +580,13 @@ def _parse_datetime(value: str | None) -> datetime:
         try:
             parsed = datetime.strptime(normalized, fmt)
             if parsed.tzinfo is not None:
-                return parsed.astimezone(timezone.utc).replace(tzinfo=None)
-            return parsed
+                return parsed.astimezone(timezone.utc)
+            return parsed.replace(tzinfo=timezone.utc)
         except ValueError:
             continue
 
     logger.debug("Failed to parse datetime value: %s", value)
-    return datetime.utcnow()
+    return datetime.now(timezone.utc)
 
 
 def _normalize_indicator(indicator: str | None) -> str:
@@ -602,7 +606,15 @@ def _source_confidence(source: str | None) -> float:
 
 
 def _utcnow() -> datetime:
-    return datetime.utcnow()
+    return datetime.now(timezone.utc)
+
+
+def _ensure_utc_datetime(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
 
 
 def _append_threat(
@@ -634,6 +646,9 @@ def _append_threat(
 
 def fetch_otx_pulses(days_back: int = 1) -> List[Dict[str, Any]]:
     threats: List[Dict[str, Any]] = []
+    if not OTX_KEY:
+        logger.warning("Skipping AlienVault OTX collection because API key is missing")
+        return threats
     headers = {}
     if OTX_KEY:
         headers["X-OTX-API-KEY"] = OTX_KEY
@@ -647,7 +662,7 @@ def fetch_otx_pulses(days_back: int = 1) -> List[Dict[str, Any]]:
         )
         response.raise_for_status()
         pulses = response.json().get("results", [])
-        cutoff = datetime.utcnow() - timedelta(days=days_back)
+        cutoff = _utcnow() - timedelta(days=days_back)
 
         for pulse in pulses:
             modified_at = _parse_datetime(pulse.get("modified") or pulse.get("created"))
@@ -697,20 +712,24 @@ def fetch_otx_pulses(days_back: int = 1) -> List[Dict[str, Any]]:
 
 def fetch_urlhaus_recent() -> List[Dict[str, Any]]:
     threats: List[Dict[str, Any]] = []
+    if not URLHAUS_AUTH_KEY:
+        logger.warning("Skipping URLhaus collection because auth key is missing")
+        return threats
 
     try:
-        response = requests.post(
-            "https://urlhaus-api.abuse.ch/v1/urls/recent/limit/20/",
+        response = requests.get(
+            f"https://urlhaus-api.abuse.ch/v2/files/exports/{URLHAUS_AUTH_KEY}/recent.csv",
             timeout=10,
         )
         response.raise_for_status()
-        payload = response.json()
+        reader = csv.DictReader(io.StringIO(response.text))
 
-        for item in payload.get("urls", []):
+        for item in list(reader)[:20]:
             indicator = item.get("url")
-            url_status = (item.get("url_status") or "").lower()
-            threat_type_name = item.get("threat") or "malicious url"
-            tags = item.get("tags") or []
+            url_status = (item.get("url_status") or item.get("status") or "").lower()
+            threat_type_name = item.get("threat") or item.get("threat_type") or "malicious url"
+            raw_tags = item.get("tags") or ""
+            tags = [tag.strip() for tag in raw_tags.replace("|", ",").split(",") if tag.strip()]
             risk_score = 90 if url_status == "online" else 75
             summary = f"URLhaus classified this URL as {threat_type_name}"
 
@@ -756,7 +775,7 @@ def fetch_abuseipdb_recent(api_key: str, days: int = 1) -> List[Dict[str, Any]]:
         )
         response.raise_for_status()
         entries = response.json().get("data", [])
-        cutoff = datetime.utcnow() - timedelta(days=days)
+        cutoff = _utcnow() - timedelta(days=days)
 
         for item in entries:
             last_reported_at = _parse_datetime(item.get("lastReportedAt"))
@@ -794,12 +813,30 @@ def fetch_phish_tank_recent() -> List[Dict[str, Any]]:
     threats: List[Dict[str, Any]] = []
 
     try:
-        response = requests.get(
+        candidate_urls = []
+        if PHISHTANK_APP_KEY:
+            candidate_urls.extend([
+                f"http://data.phishtank.com/data/{PHISHTANK_APP_KEY}/online-valid.json",
+                f"https://data.phishtank.com/data/{PHISHTANK_APP_KEY}/online-valid.json",
+            ])
+        candidate_urls.extend([
+            "http://data.phishtank.com/data/online-valid.json",
             "https://data.phishtank.com/data/online-valid.json",
-            timeout=15,
-        )
-        response.raise_for_status()
-        entries = response.json()
+        ])
+
+        entries = None
+        last_error = None
+        for candidate_url in candidate_urls:
+            try:
+                response = requests.get(candidate_url, timeout=15, headers={"User-Agent": "TrustiveAI/1.0"})
+                response.raise_for_status()
+                entries = response.json()
+                break
+            except Exception as exc:
+                last_error = exc
+
+        if entries is None:
+            raise last_error or RuntimeError("No working PhishTank feed URL")
 
         for item in entries[:20]:
             target = item.get("target") or "phishing target"
@@ -920,11 +957,11 @@ def store_collected_intel(threats: List[Dict[str, Any]], job_name: str = "collec
 
             indicator_type = str(threat.get("threat_type") or "unknown").lower()
             risk_score = max(0, min(100, int(threat.get("risk_score", 0) or 0)))
-            published_at = (
+            published_at = _ensure_utc_datetime(
                 threat.get("published_at")
                 if isinstance(threat.get("published_at"), datetime)
                 else _parse_datetime(threat.get("published_at"))
-            )
+            ) or _utcnow()
             source = threat.get("source") or "Threat intelligence feed"
             summary = threat.get("summary") or f"Collected from {source}"
 
@@ -965,8 +1002,14 @@ def store_collected_intel(threats: List[Dict[str, Any]], job_name: str = "collec
             item["risk_score"] = max(item["risk_score"], risk_score)
             item["threat_level"] = _resolve_threat_level(item["risk_score"])
             item["summary"] = summary if risk_score >= item["risk_score"] else item["summary"]
-            item["first_seen_at"] = min(item["first_seen_at"], published_at)
-            item["last_seen_at"] = max(item["last_seen_at"], published_at)
+            item["first_seen_at"] = min(
+                _ensure_utc_datetime(item["first_seen_at"]) or published_at,
+                published_at,
+            )
+            item["last_seen_at"] = max(
+                _ensure_utc_datetime(item["last_seen_at"]) or published_at,
+                published_at,
+            )
             item["last_collected_at"] = _utcnow()
             item["latest_raw_intel"] = threat.get("raw_intel", {}) or item["latest_raw_intel"]
             item["sightings"] += 1
@@ -985,9 +1028,15 @@ def store_collected_intel(threats: List[Dict[str, Any]], job_name: str = "collec
                 existing.risk_score = max(existing.risk_score or 0, item["risk_score"])
                 existing.threat_level = _resolve_threat_level(existing.risk_score)
                 existing.summary = item["summary"] or existing.summary
-                existing.last_seen_at = max(existing.last_seen_at or item["last_seen_at"], item["last_seen_at"])
+                existing.last_seen_at = max(
+                    _ensure_utc_datetime(existing.last_seen_at) or item["last_seen_at"],
+                    item["last_seen_at"],
+                )
                 existing.last_collected_at = item["last_collected_at"]
-                existing.first_seen_at = min(existing.first_seen_at or item["first_seen_at"], item["first_seen_at"])
+                existing.first_seen_at = min(
+                    _ensure_utc_datetime(existing.first_seen_at) or item["first_seen_at"],
+                    item["first_seen_at"],
+                )
                 merged_sources = sorted(set((existing.sources or []) + sources))
                 existing.sources = merged_sources
                 existing.source_count = len(merged_sources)

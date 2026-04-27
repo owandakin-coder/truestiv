@@ -15,6 +15,10 @@ class Settings(BaseSettings):
 
     # הוספת שדות עבור Threat Intelligence ו-Redis
     OTX_API_KEY: str = ""
+    URLHAUS_AUTH_KEY: str = ""
+    PHISHTANK_APP_KEY: str = ""
+    IBM_XFORCE_API_KEY: str = ""
+    IBM_XFORCE_API_PASSWORD: str = ""
     REDIS_HOST: str = "localhost"
     REDIS_PORT: int = 6379
     FRONTEND_URL: str = ""
