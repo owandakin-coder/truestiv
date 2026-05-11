@@ -5,7 +5,8 @@ from email.parser import Parser
 from email.utils import parseaddr
 from urllib.parse import quote, urlparse
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Header
+from typing import Optional
 from sqlalchemy.orm import Session
 
 from app.core.auth import get_current_user
@@ -34,6 +35,25 @@ except Exception:
     dns_resolver = None
 
 router = APIRouter()
+
+
+def get_optional_user(
+    authorization: Optional[str] = Header(default=None),
+    db: Session = Depends(get_db),
+) -> "Optional[User]":
+    if not authorization or not authorization.startswith("Bearer "):
+        return None
+    token = authorization.split(" ", 1)[1]
+    try:
+        from app.core.auth import verify_token
+        payload = verify_token(token)
+        user_id = payload.get("sub") or payload.get("user_id")
+        if not user_id:
+            return None
+        return db.query(User).filter(User.id == int(user_id)).first()
+    except Exception:
+        return None
+
 IP_PATTERN = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
 SOURCE_CONFIDENCE = {
     "alienvault otx": 0.72,
@@ -1186,7 +1206,7 @@ def ip_lookup(
 def domain_lookup(
     domain: str,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: "Optional[User]" = Depends(get_optional_user),
 ):
     normalized_domain = _normalize_domain(domain)
     if not normalized_domain or "." not in normalized_domain:
@@ -1221,7 +1241,7 @@ def domain_lookup(
         .order_by(ScanHistory.created_at.desc())
         .limit(120)
         .all()
-    )
+    ) if current_user else []
     matching_scans = [
         item
         for item in scan_matches
@@ -1246,7 +1266,7 @@ def domain_lookup(
         .order_by(EmailAnalysis.created_at.desc())
         .limit(80)
         .all()
-    )
+    ) if current_user else []
     matching_analyses = [
         item
         for item in analysis_matches
@@ -2505,3 +2525,4 @@ def collect_now(current_user: User = Depends(get_current_user)):
         "success": True,
         "result": collect_all_intel(),
     }
+
