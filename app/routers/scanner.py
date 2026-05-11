@@ -356,17 +356,26 @@ def build_bulk_result_item(ioc_type: str, indicator: str, payload: dict) -> dict
     }
 
 SUSPICIOUS_PATTERNS = [
-    # Homograph / typosquat patterns
+    # Homograph / typosquat
     r'paypa1', r'arnazon', r'g00gle', r'rn\.com',
     r'micosoft', r'gooogle', r'faceb00k', r'paypai',
     # Phishing lure paths
     r'secure-verify', r'login-confirm', r'account-suspended',
     r'verify-now', r'update-billing', r'free-prize',
     r'account-verify', r'signin-confirm', r'password-reset-required',
-    # Suspicious TLDs (only as full TLD, not substring)
+    # Suspicious TLDs
     r'\.xyz$', r'\.tk$', r'\.ml$', r'\.ga$', r'\.cf$',
     r'\.gq$', r'\.top$', r'\.click$',
 ]
+
+# Well-known legitimate domains — never flagged
+DOMAIN_WHITELIST = {
+    'google.com', 'youtube.com', 'facebook.com', 'twitter.com', 'x.com',
+    'instagram.com', 'linkedin.com', 'github.com', 'microsoft.com',
+    'apple.com', 'amazon.com', 'cloudflare.com', 'check-host.net',
+    'httpstatus.io', 'ipinfo.io', 'shodan.io', 'virustotal.com',
+    'abuseipdb.com', 'whois.domaintools.com', 'mxtoolbox.com',
+}
 
 MALICIOUS_DOMAINS = [
     'malware-test.com', 'phishing-example.com',
@@ -394,12 +403,30 @@ def analyze_url(data: dict, db: Session = Depends(get_db), current_user: User = 
     brand_impersonation = None
     try:
         domain = re.findall(r'://([^/]+)', url)[0].lower()
+        # Skip scoring for known-legitimate domains
+        clean_domain = domain.split(':')[0]  # strip port
+        if clean_domain in DOMAIN_WHITELIST:
+            return {
+                "success": True,
+                "url": url,
+                "domain": clean_domain,
+                "threat_level": "safe",
+                "risk_score": 0,
+                "confidence": 95,
+                "indicators": [],
+                "recommendation": "allow",
+                "summary": "Domain is on the verified safe list.",
+                "brand_impersonation": {"active": False, "score": 0, "threat_level": "safe"}
+            }
         brand_impersonation = detect_brand_impersonation(domain)
         if domain in MALICIOUS_DOMAINS:
             indicators.append(f"Known malicious domain: {domain}")
             risk_score += 60
 
-        if any(c in domain for c in ['0', '1', 'rn', 'vv']):
+        # Only flag homograph if combined with other suspicious signals
+        homograph_chars = sum(1 for c in ['rn', 'vv'] if c in domain)
+        digit_subs = sum(1 for pair in [('0','o'),('1','l'),('3','e')] if pair[0] in domain and pair[1] in domain)
+        if homograph_chars > 0 or digit_subs >= 2:
             indicators.append("Possible homograph attack")
             risk_score += 20
 
@@ -430,9 +457,10 @@ def analyze_url(data: dict, db: Session = Depends(get_db), current_user: User = 
         indicators.append("Could not parse domain")
         risk_score += 10
 
+    # Reduce HTTPS penalty — many legit tools use HTTP
     if not url.startswith('https://'):
         indicators.append("No HTTPS")
-        risk_score += 10
+        risk_score += 3
 
     risk_score = min(100, risk_score)
     if risk_score >= 60:
