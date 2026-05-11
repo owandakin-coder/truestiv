@@ -1,7 +1,27 @@
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, HTTPException, Depends, Header
+from typing import Optional
 from sqlalchemy.orm import Session
 from app.core.database import get_db
 from app.core.auth import get_current_user
+
+
+def get_optional_user(
+    authorization: Optional[str] = Header(default=None),
+    db: Session = Depends(get_db),
+) -> Optional[User]:
+    """Returns authenticated user or None for guests."""
+    if not authorization or not authorization.startswith("Bearer "):
+        return None
+    token = authorization.split(" ", 1)[1]
+    try:
+        from app.core.auth import verify_token
+        payload = verify_token(token)
+        user_id = payload.get("sub") or payload.get("user_id")
+        if not user_id:
+            return None
+        return db.query(User).filter(User.id == int(user_id)).first()
+    except Exception:
+        return None
 from app.core.ai_engine import analyze_threat
 from app.models.models import IPScanObservation, ScanHistory, User
 from app.services.threat_intel import aggregate_ip_intel, aggregate_url_intel
@@ -369,7 +389,7 @@ MALICIOUS_DOMAINS = [
 ]
 
 @router.post("/url")
-def analyze_url(data: dict, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+def analyze_url(data: dict, db: Session = Depends(get_db), current_user: Optional[User] = Depends(get_optional_user)):
     url = data.get("url", "").strip()
     if not url:
         raise HTTPException(status_code=400, detail="URL is required")
@@ -456,8 +476,9 @@ def analyze_url(data: dict, db: Session = Depends(get_db), current_user: User = 
         "brand_impersonation": brand_impersonation
     }
     try:
-        persist_scan_history(db, current_user.id, "url", url, response, source="scanner_url")
-        db.commit()
+        if current_user:
+            persist_scan_history(db, current_user.id, "url", url, response, source="scanner_url")
+            db.commit()
     except Exception:
         db.rollback()
     return response
@@ -684,13 +705,13 @@ def generate_api_key(data: dict, current_user: User = Depends(get_current_user))
 
 
 @router.post("/ip/enhanced")
-def check_ip_enhanced(data: dict, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+def check_ip_enhanced(data: dict, db: Session = Depends(get_db), current_user: Optional[User] = Depends(get_optional_user)):
     ip = data.get("ip", "").strip()
     if not ip:
         raise HTTPException(status_code=400, detail="IP address is required")
     result = aggregate_ip_intel(ip)
     try:
-        if result.get("success"):
+        if result.get("success") and current_user:
             record_ip_scan_observation(db, current_user.id, ip, result, source="scanner_enhanced")
             persist_scan_history(db, current_user.id, "ip", ip, result, source="scanner_enhanced")
             db.commit()
