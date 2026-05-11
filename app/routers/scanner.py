@@ -1,27 +1,7 @@
-from fastapi import APIRouter, HTTPException, Depends, Header
-from typing import Optional
+from fastapi import APIRouter, HTTPException, Depends
 from sqlalchemy.orm import Session
 from app.core.database import get_db
 from app.core.auth import get_current_user
-
-
-def get_optional_user(
-    authorization: Optional[str] = Header(default=None),
-    db: Session = Depends(get_db),
-) -> Optional[User]:
-    """Returns authenticated user or None for guests."""
-    if not authorization or not authorization.startswith("Bearer "):
-        return None
-    token = authorization.split(" ", 1)[1]
-    try:
-        from app.core.auth import verify_token
-        payload = verify_token(token)
-        user_id = payload.get("sub") or payload.get("user_id")
-        if not user_id:
-            return None
-        return db.query(User).filter(User.id == int(user_id)).first()
-    except Exception:
-        return None
 from app.core.ai_engine import analyze_threat
 from app.models.models import IPScanObservation, ScanHistory, User
 from app.services.threat_intel import aggregate_ip_intel, aggregate_url_intel
@@ -376,11 +356,16 @@ def build_bulk_result_item(ioc_type: str, indicator: str, payload: dict) -> dict
     }
 
 SUSPICIOUS_PATTERNS = [
-    r'bit\.ly', r'tinyurl', r'goo\.gl', r't\.co',
+    # Homograph / typosquat patterns
     r'paypa1', r'arnazon', r'g00gle', r'rn\.com',
+    r'micosoft', r'gooogle', r'faceb00k', r'paypai',
+    # Phishing lure paths
     r'secure-verify', r'login-confirm', r'account-suspended',
     r'verify-now', r'update-billing', r'free-prize',
+    r'account-verify', r'signin-confirm', r'password-reset-required',
+    # Suspicious TLDs (only as full TLD, not substring)
     r'\.xyz$', r'\.tk$', r'\.ml$', r'\.ga$', r'\.cf$',
+    r'\.gq$', r'\.top$', r'\.click$',
 ]
 
 MALICIOUS_DOMAINS = [
@@ -389,7 +374,7 @@ MALICIOUS_DOMAINS = [
 ]
 
 @router.post("/url")
-def analyze_url(data: dict, db: Session = Depends(get_db), current_user: Optional[User] = Depends(get_optional_user)):
+def analyze_url(data: dict, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     url = data.get("url", "").strip()
     if not url:
         raise HTTPException(status_code=400, detail="URL is required")
@@ -476,9 +461,8 @@ def analyze_url(data: dict, db: Session = Depends(get_db), current_user: Optiona
         "brand_impersonation": brand_impersonation
     }
     try:
-        if current_user:
-            persist_scan_history(db, current_user.id, "url", url, response, source="scanner_url")
-            db.commit()
+        persist_scan_history(db, current_user.id, "url", url, response, source="scanner_url")
+        db.commit()
     except Exception:
         db.rollback()
     return response
@@ -705,13 +689,13 @@ def generate_api_key(data: dict, current_user: User = Depends(get_current_user))
 
 
 @router.post("/ip/enhanced")
-def check_ip_enhanced(data: dict, db: Session = Depends(get_db), current_user: Optional[User] = Depends(get_optional_user)):
+def check_ip_enhanced(data: dict, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     ip = data.get("ip", "").strip()
     if not ip:
         raise HTTPException(status_code=400, detail="IP address is required")
     result = aggregate_ip_intel(ip)
     try:
-        if result.get("success") and current_user:
+        if result.get("success"):
             record_ip_scan_observation(db, current_user.id, ip, result, source="scanner_enhanced")
             persist_scan_history(db, current_user.id, "ip", ip, result, source="scanner_enhanced")
             db.commit()
