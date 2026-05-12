@@ -10,6 +10,7 @@ from app.core.database import get_db
 from app.models.models import User
 
 oauth2_scheme = HTTPBearer(auto_error=True)
+oauth2_scheme_optional = HTTPBearer(auto_error=False)
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     return bcrypt.checkpw(plain_password.encode("utf-8"), hashed_password.encode("utf-8"))
@@ -33,7 +34,6 @@ def get_current_user(
         detail="Could not validate credentials",
         headers={"WWW-Authenticate": "Bearer"},
     )
-
     try:
         token = credentials.credentials
         payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
@@ -44,9 +44,24 @@ def get_current_user(
         raise credentials_exception
     except Exception:
         raise credentials_exception
-
     user = db.query(User).filter(User.email == email).first()
     if user is None:
         raise credentials_exception
-
     return user
+
+def get_optional_user(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(oauth2_scheme_optional),
+    db: Session = Depends(get_db)
+) -> Optional[User]:
+    """Returns authenticated user or None for unauthenticated guests."""
+    if not credentials or not credentials.credentials:
+        return None
+    try:
+        token = credentials.credentials
+        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+        email: str = payload.get("sub")
+        if not email:
+            return None
+        return db.query(User).filter(User.email == email).first()
+    except Exception:
+        return None
