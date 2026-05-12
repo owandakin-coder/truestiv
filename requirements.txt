@@ -32,3 +32,4 @@ pillow
 opencv-python-headless
 pytesseract
 numpy
+python-3.12
