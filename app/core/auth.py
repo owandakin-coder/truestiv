@@ -9,7 +9,7 @@ from app.core.config import settings
 from app.core.database import get_db
 from app.models.models import User
 
-oauth2_scheme = HTTPBearer(auto_error=True)
+oauth2_scheme = HTTPBearer(auto_error=False)
 oauth2_scheme_optional = HTTPBearer(auto_error=False)
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
